@@ -69,6 +69,9 @@ You must ONLY report these types of errors in Korean:
    - 마침표/쉼표/물음표 등 필수 문장부호가 빠져
      문장이 비문이 되거나 구조가 심각하게 모호한 경우만.
    - 단순한 스타일 차이는 오류가 아니다.
+   
+5.  **MORPHEME SPLIT ERRORS(형태소 오류):** 무조건 오류로 판단한다. 
+    예: "묻 는", "먹 는", "잡 아" → 모두 오타.
 
 You must NOT:
 - 단어 선택이 "더 자연스럽다/부자연스럽다"는 식의 의견을 말하지 마라.

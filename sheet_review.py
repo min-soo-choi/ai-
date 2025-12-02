@@ -75,7 +75,10 @@ def create_review_prompt(row: dict) -> str:
     3.  **RESPECT STYLING CONVENTIONS:** It is CORRECT for *italicized English* to be represented with `'single quotes'` or `《double angle brackets》` in Korean. This is NOT an error.
     4.  **GROUND YOUR FINDINGS:** When reporting an error, you MUST quote the problematic text.
     5.  **NO IDENTICAL CORRECTIONS:** A suggested correction must be different from the original text.
-
+    6. **Morpheme Split Errors:** If a verb, adjective, ending, or particle that must remain a single morpheme is incorrectly split, it must always be treated as an error. 
+   Examples: "묻 는", "먹 는", "잡 아"
+   However, spacing cases where both forms are officially acceptable in Korean orthography 
+   (e.g., "해 보다" / "해보다") must be excluded from error detection.
     ---
 
     **ANALYSIS WORKFLOW:**
