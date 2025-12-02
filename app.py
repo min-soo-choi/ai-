@@ -3,6 +3,7 @@
 import json
 import time
 from collections import defaultdict
+import os
 
 import streamlit as st
 import google.generativeai as genai
@@ -12,9 +13,14 @@ import google.generativeai as genai
 # --------------------------
 # Streamlit Cloud / 로컬 .streamlit/secrets.toml 에서
 # GEMINI_API_KEY 를 넣어둘 거야.
-API_KEY = st.secrets.get("GEMINI_API_KEY")
+API_KEY = (
+    os.environ.get("GEMINI_API_KEY")  # 환경변수 우선
+    or st.secrets.get("GEMINI_API_KEY")  # 없으면 secrets에서
+)
+
 if not API_KEY:
-    st.stop()  # 키 없으면 바로 중단
+    st.error("GEMINI_API_KEY가 설정되어 있지 않습니다.")
+    st.stop()
 genai.configure(api_key=API_KEY)
 
 MODEL_ID = "gemini-2.0-flash-001"
