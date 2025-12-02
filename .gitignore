@@ -6,6 +6,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.sqlite3
+test_google_auth.py
 
 # ------------------------
 # 가상환경(venv)
