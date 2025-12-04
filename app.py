@@ -2,8 +2,6 @@
 # -*- coding: utf-8 -*-
 import json
 import time
-from collections import defaultdict
-import os
 import streamlit as st
 import google.generativeai as genai
 from sheet_review import run_sheet_review
@@ -26,101 +24,9 @@ model = genai.GenerativeModel("gemini-2.0-flash-001")
 # 1. 검수 프롬프트 (네 로직 기반, 단일 텍스트 버전)
 # --------------------------
 
-def create_review_prompt_for_text(korean_text: str) -> str:
-    """
-    한국어 텍스트(문장/문단) 하나만 검수하는 프롬프트.
-    - 의미/스타일은 건드리지 않고
-    - 오탈자 / 조사·어미 / 띄어쓰기 / 기본 문장부호만 본다.
-    """
-    prompt = f"""
-You are a machine-like **Korean text proofreader**.
-Your ONLY job is to detect **objective, verifiable errors** in the following Korean text.
-You are strictly forbidden from suggesting stylistic improvements, rephrasing, or commenting on "more natural" expressions.
-
-You MUST respond with a single valid JSON object with the following keys:
-
-- "suspicion_score": integer (1~5)
-- "content_typo_report": string
-- "translated_typo_report": string
-- "markdown_report": string
-
-If there is nothing to report, each report field MUST be an empty string "" (do NOT write things like "오류 없음", "문제 없음", etc.).
-
----
-
-## 1. What counts as an error?
-
-You must ONLY report these types of errors in Korean:
-
-1. **Obvious typos (오탈자)**  
-   - 잘못된 철자, 중복 글자, 명백한 입력 실수  
-   - 예) "이점들을를" → "이점들을"
-
-2. **Particles / endings (조사, 어미) errors**  
-   - 주격/목적격/보격/부사격 조사 잘못 사용  
-   - 동사/형용사 어미가 문법적으로 분명히 잘못된 경우  
-   - 예) "사과을" → "사과를"
-
-3. **Spacing (띄어쓰기) errors**  
-   - 띄어쓰기/붙여쓰기 규범이 명백히 잘못된 경우  
-   - 예) "책을읽고" → "책을 읽고"
-
-4. **Basic punctuation (기본 문장부호) errors**  
-   - 마침표/쉼표/물음표 등 필수 문장부호가 빠져
-     문장이 비문이 되거나 구조가 심각하게 모호한 경우만.
-   - 단순한 스타일 차이는 오류가 아니다.
-   
-5.  **MORPHEME SPLIT ERRORS(형태소 오류):** 무조건 오류로 판단한다. 
-    예: "묻 는", "먹 는", "잡 아" → 모두 오타.
-
-You must NOT:
-- 단어 선택이 "더 자연스럽다/부자연스럽다"는 식의 의견을 말하지 마라.
-- 의미를 바꾸는 재서술을 하지 마라.
-- 단순 어휘 교체 제안을 하지 마라 (예: "근사한" 대신 "멋있는" 추천 금지).
-
----
-
-## 2. Output format
-
-Return EXACTLY ONE JSON object, with no additional text, no Markdown, no code fences.
-
-For example:
-
-{{
-  "suspicion_score": 3,
-  "content_typo_report": "",
-  "translated_typo_report": "- '이점들을를'에서 오타 발견. '이점들을'로 수정해야 함.",
-  "markdown_report": ""
-}}
-
-### Rules for suspicion_score
-- 1: 보고할 만한 오류가 없을 때 (모든 리포트 필드가 "")
-- 2~3: 소수의 명확한 오류가 있을 때
-- 4~5: 다수의 오류 또는 전반적으로 품질이 의심될 때
-
-### Rules for reports
-- 각 리포트에는 반드시 **문제가 된 부분을 직접 인용**하고, 제안 수정안을 함께 제시한다.
-- 한 줄에 하나의 오류를 `- `로 시작하는 bullet 형식으로 작성한다.
-  - 예) "- '사과을'에서 목적격 조사 오류. '사과를'로 수정해야 함."
-
-If there is NO objective error at all:
-- "suspicion_score": 1
-- "content_typo_report": ""
-- "translated_typo_report": ""
-- "markdown_report": ""
-
----
-
-## 3. Text to review
-
-Now apply all the rules above to the following Korean text:
-
-- plain_korean: "{korean_text}"
-- markdown_korean: "{korean_text}"
-"""
-    return prompt
-
-
+# --------------------------
+# 공통: Gemini 호출 / 결과 정제
+# --------------------------
 def analyze_text_with_gemini(prompt: str, max_retries: int = 3) -> dict:
     """Gemini를 JSON 모드로 호출"""
     for attempt in range(max_retries):
@@ -137,6 +43,7 @@ def analyze_text_with_gemini(prompt: str, max_retries: int = 3) -> dict:
 
         except Exception as e:
             if attempt < max_retries - 1:
+                # 지수 백오프
                 time.sleep(3 * (attempt + 1))
             else:
                 return {
@@ -164,7 +71,7 @@ def validate_and_clean_analysis(result: dict) -> dict:
         "markdown_report": result.get("markdown_report", "") or "",
     }
 
-    # 스타일/문체 제안 금지 키워드
+    # 스타일/문체 제안 금지 키워드 (한국어 쪽)
     forbidden_keywords = [
         "문맥상",
         "부적절",
@@ -209,9 +116,111 @@ def validate_and_clean_analysis(result: dict) -> dict:
     }
 
 
-def review_text(korean_text: str) -> dict:
-    """Streamlit에서 호출할 최종 함수"""
-    prompt = create_review_prompt_for_text(korean_text)
+# --------------------------
+# 1-A. 한국어 단일 텍스트 검수 프롬프트 + 래퍼
+# --------------------------
+def create_korean_review_prompt_for_text(korean_text: str) -> str:
+    """
+    한국어 텍스트(문장/문단) 하나만 검수하는 프롬프트.
+    - 오탈자 / 조사·어미 / 띄어쓰기 / 기본 문장부호 / 형태소 분리 / 반복 오타
+    """
+    prompt = f"""
+    You are a machine-like **Korean text proofreader**.
+    Your ONLY job is to detect **objective, verifiable errors** in the following Korean text.
+    You are strictly forbidden from suggesting stylistic improvements, rephrasing, or commenting on "more natural" expressions.
+
+You MUST respond with a single valid JSON object with the following keys:
+
+- "suspicion_score": integer (1~5)
+- "content_typo_report": string
+- "translated_typo_report": string
+- "markdown_report": string
+
+For this task:
+- Use "translated_typo_report" to report errors in the Korean text.
+- "content_typo_report" should remain empty ("") unless you are explicitly asked to check English.
+
+If there is nothing to report, each report field MUST be an empty string "" (do NOT write things like "오류 없음", "문제 없음", etc.).
+
+---
+
+## 1. What counts as an error in Korean?
+
+1. **Obvious typos (오탈자)**  
+   - 잘못된 철자, 중복 글자, 명백한 입력 실수  
+   - 예) "이점들을를" → "이점들을"
+
+2. **Particles / endings (조사, 어미) errors**  
+   - 주격/목적격/보격/부사격 조사 잘못 사용  
+   - 동사/형용사 어미가 문법적으로 분명히 잘못된 경우  
+   - 예) "사과을" → "사과를"
+
+3. **Spacing (띄어쓰기) errors**  
+   - 띄어쓰기/붙여쓰기 규범이 명백히 잘못된 경우  
+   - 예) "책을읽고" → "책을 읽고"
+
+4. **Basic punctuation (기본 문장부호) errors**  
+   - 마침표/쉼표/물음표 등 필수 문장부호가 빠져
+     문장이 비문이 되거나 구조가 심각하게 모호한 경우만.
+   - 따옴표/쌍따옴표가 한쪽만 있거나 짝이 안 맞는 경우는 항상 오류.
+   - 예)
+     - 잘못된 예: 나는 말한다."
+     - 올바른 예: "나는 말한다."
+
+5. **Morpheme Split Errors (형태소 분리 오류)**  
+   - 동사, 형용사, 어미, 조사 등 하나의 형태소로 결합되어야 하는 항목이 
+     부적절하게 분리된 경우는 무조건 오류.
+   - 예:
+     - "묻 는" → "묻는"
+     - "먹 는" → "먹는"
+     - "잡 아" → "잡아"
+     - "된 다" → "된다"
+     - "간 다" → "간다"
+   - 단, 한국어 맞춤법에서 두 형태 모두 허용되는 띄어쓰기(예: "해 보다"/"해보다")는 제외.
+
+6. **Repetition Typos (반복 오타)**  
+   - 유효한 한국어 단어를 이루지 못하는 음절/글자 반복은 항상 오타.
+   - 예:
+     - "된다따따." → "된다."
+     - "합니다아아" → "합니다."
+     - "간다다다" → "간다."
+
+---
+
+## 2. Output format
+
+Return EXACTLY ONE JSON object, with no additional text, no Markdown, no code fences.
+
+For example:
+
+{{
+  "suspicion_score": 3,
+  "content_typo_report": "",
+  "translated_typo_report": "- '사과을'에서 목적격 조사 오류. '사과를'로 수정해야 함.",
+  "markdown_report": ""
+}}
+
+If there is NO objective error at all:
+- "suspicion_score": 1
+- "content_typo_report": ""
+- "translated_typo_report": ""
+- "markdown_report": ""
+
+---
+
+## 3. Text to review
+
+Now apply all the rules above to the following Korean text:
+
+- plain_korean: "{korean_text}"
+- markdown_korean: "{korean_text}"
+"""
+    return prompt
+
+
+def review_korean_text(korean_text: str) -> dict:
+    """한국어 텍스트 검수 래퍼"""
+    prompt = create_korean_review_prompt_for_text(korean_text)
     raw = analyze_text_with_gemini(prompt)
     cleaned = validate_and_clean_analysis(raw)
     return {
@@ -224,9 +233,188 @@ def review_text(korean_text: str) -> dict:
 
 
 # --------------------------
+# 1-B. 영어 단일 텍스트 검수 프롬프트 + 래퍼
+# --------------------------
+def create_english_review_prompt_for_text(english_text: str) -> str:
+    """
+    영어 텍스트(문장/문단) 하나만 검수하는 프롬프트.
+    - 스펠링 / 단어 반복 / 잘못된 띄어쓰기 / AI ↔ Al 오타 / 문장부호 / 대문자 규칙
+    - ⚠ 모든 리포트는 한국어로 작성해야 한다.
+    """
+    prompt = f"""
+You are a machine-like **English text proofreader**.
+Your ONLY job is to detect **objective, verifiable errors** in the following English text.
+You are strictly forbidden from judging tone, style, naturalness, or suggesting alternative phrasing.
+
+Your response MUST be a valid JSON object with exactly these keys:
+- "suspicion_score": integer (1~5)
+- "content_typo_report": string
+- "translated_typo_report": string
+- "markdown_report": string
+
+All explanations in the *_report fields MUST be written in **Korean**.
+
+If nothing is wrong, each report field MUST be an empty string "".
+
+---
+
+# 1. Objective Error Rules (You MUST follow ALL of these)
+
+## (A) Spelling / Typo Errors (MUST detect)
+A token MUST be treated as a spelling error if:
+1. It is similar to a valid English word (1–2 letters wrong/missing/swapped), AND
+2. It is not a proper noun, acronym, or technical token.
+
+Examples (patterns, not a full list):
+1. recieve → receive
+2. enviroment → environment
+3. understaning → understanding
+4. langauge → language
+5. problme → problem
+6. definately → definitely
+7. seperated → separated
+8. occured → occurred
+9. adress → address
+10. wierd → weird
+
+Always treat these patterns as typos:
+- Missing vowel (sytem → system)
+- Letter swap (teh → the)
+- Double-letter confusion (comming → coming)
+- Incorrect ending (becuase → because)
+
+---
+
+## (B) AI 문맥에서 Al → AI (MUST ALWAYS FLAG)
+If the sentence is about artificial intelligence (model, system, tool, LLM, agent, chatbot):
+- “Al” (A + lowercase L) MUST be treated as a typo for “AI”.
+
+Examples:
+- Al model → AI model
+- Al system → AI system
+
+---
+
+## (C) Capitalization Errors (MUST FLAG)
+These MUST be treated as objective errors:
+- Sentence beginning with lowercase letter  
+  → e.g. “al i do…” MUST be corrected to “Al I do…”
+- Pronoun “I” in lowercase  
+  → “i do not…” MUST be corrected to “I do not…”
+- Proper nouns clearly wrong  
+  → london → London
+
+---
+
+## (D) Basic punctuation errors (MUST FLAG)
+- Missing period at end of a sentence  
+- Run-on sentence without punctuation  
+- Broken quotation marks  
+- Two sentences joined without a period
+
+Examples:
+- This is wrong  
+- He said "Hello.  
+- I went home he slept.
+
+---
+
+## (E) Spacing / duplication errors (MUST FLAG)
+- "re turn" → "return"
+- "the the" → "the"
+- "mod el" → "model"
+
+---
+
+# 2. Output style (IMPORTANT)
+- All reports MUST be in Korean.
+- Each error MUST follow this format:
+
+"- 'understaning' → 'understanding': 'understaning'은 철자 오타이며, 'understanding'으로 수정해야 합니다."
+
+If there is NO objective error:
+- suspicion_score = 1
+- all reports = ""
+
+---
+
+# 3. Text to review
+plain_english: "{english_text}"
+markdown_english: "{english_text}"
+
+
+## 4. Self-check example (MUST follow)
+
+For the sentence:
+"This is a simple understaning of the AI model."
+
+A CORRECT JSON OUTPUT EXAMPLE (do NOT copy, just follow the same logic) is:
+
+{{
+  "suspicion_score": 3,
+  "content_typo_report": "- 'understaning' → 'understanding': 'understaning'은 'understanding'의 철자 오타이므로 'understanding'으로 수정해야 합니다.",
+  "markdown_report": ""
+}}
+
+If the input text contains the word "understaning", you MUST always treat it as a spelling error of "understanding".
+
+"""
+    return prompt
+
+
+
+
+def review_english_text(english_text: str) -> dict:
+    """영어 텍스트 검수 래퍼"""
+    prompt = create_english_review_prompt_for_text(english_text)
+    raw = analyze_text_with_gemini(prompt)
+    cleaned = validate_and_clean_analysis(raw)
+    return {
+        "score": cleaned.get("suspicion_score"),
+        "content_typo_report": cleaned.get("content_typo_report", ""),
+        "markdown_report": cleaned.get("markdown_report", ""),
+        "raw": raw,  # 디버깅용
+    }
+    
+def summarize_json_diff(raw: dict | None, final: dict | None) -> str:
+    """
+    raw와 final JSON(dict)을 비교해서
+    - 값이 달라진 key만 bullet로 뽑아주는 간단 diff 요약.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    if not isinstance(final, dict):
+        final = {}
+
+    lines = []
+    all_keys = sorted(set(raw.keys()) | set(final.keys()))
+
+    for key in all_keys:
+        rv = raw.get(key, "<없음>")
+        fv = final.get(key, "<없음>")
+        if rv == fv:
+            continue
+
+        # 보기 좋게 문자열로 캐스팅
+        rv_str = json.dumps(rv, ensure_ascii=False) if isinstance(rv, (dict, list)) else str(rv)
+        fv_str = json.dumps(fv, ensure_ascii=False) if isinstance(fv, (dict, list)) else str(fv)
+
+        lines.append(
+            f"- **{key}**\n"
+            f"  - raw: `{rv_str}`\n"
+            f"  - final: `{fv_str}`"
+        )
+
+    if not lines:
+        return "차이가 없습니다. (raw와 final이 동일합니다.)"
+
+    return "\n".join(lines)
+
+
+
+# --------------------------
 # 2. Streamlit UI
 # --------------------------
-
 st.set_page_config(
     page_title="AI 검수기 (Gemini)",
     page_icon="📚",
@@ -234,18 +422,139 @@ st.set_page_config(
 )
 
 st.title("📚 AI 텍스트 검수기 (Gemini 기반)")
-st.caption("오탈자 / 조사 / 띄어쓰기 / 형식 오류 + 영어 원지문 검수에만 집중하는 검수기 (스타일 제안 금지).")
+st.caption("한국어/영어 단일 텍스트 + Google Sheets 기반 검수기 (오탈자/형식 위주, 스타일 제안 금지).")
 
-tab_main, tab_sheet, tab_about, tab_debug = st.tabs(
-    ["✏️ 텍스트 검수", "📄 시트 검수", "ℹ️ 설명", "🐞 디버그"]
+tab_ko, tab_en, tab_sheet, tab_about, tab_debug = st.tabs(
+    ["✏️ 한국어 검수", "✏️ 영어 검수", "📄 시트 검수", "ℹ️ 설명", "🐞 디버그"]
 )
 
+# --- 한국어 검수 탭 ---
+with tab_ko:
+    st.subheader("한국어 텍스트 검수")
+    default_ko = "이것은 테스트 문장 입니다. 그는는 학교에 갔다."
+    text_ko = st.text_area(
+        "한국어 텍스트 입력",
+        value=default_ko,
+        height=220,
+    )
+
+    if st.button("한국어 검수 실행", type="primary"):
+        if not text_ko.strip():
+            st.warning("먼저 한국어 텍스트를 입력해주세요.")
+        else:
+            with st.spinner("AI가 한국어 텍스트를 검수 중입니다..."):
+                result = review_korean_text(text_ko)
+
+            # 최신 결과를 세션에 저장
+            st.session_state["ko_result"] = result
+
+    # ✅ 세션에 결과가 있으면 항상 아래를 보여줌
+    if "ko_result" in st.session_state:
+        result = st.session_state["ko_result"]
+        score = result.get("score", 1)
+
+        # 🔹 raw 전체 JSON (모델이 준 원본)
+        raw_json = result.get("raw", {}) or {}
+
+        # 🔹 final: 한국어 단일 텍스트에 필요한 필드만
+        final_json = {
+            "suspicion_score": result.get("score", 1),
+            "translated_typo_report": result.get("translated_typo_report", ""),
+        }
+
+        # 🔹 raw도 비교 키만 슬림하게 잘라서 보기 좋게
+        raw_view = {
+            "suspicion_score": raw_json.get("suspicion_score"),
+            "translated_typo_report": raw_json.get("translated_typo_report", ""),
+        }
+
+        st.success("한국어 검수가 완료되었습니다!")
+        st.metric("의심 점수 (1~5)", f"{score:.2f}")
+
+        st.markdown("### 🔍 결과 비교 (Raw vs Final)")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("#### ✅ Final JSON (한국어 입력 기준 최소 필드)")
+            st.json(final_json)
+
+        with col2:
+            st.markdown("#### 🧪 Raw JSON (동일 필드만 발췌)")
+            st.json(raw_view)
+
+        st.markdown("#### 🔍 Raw vs Final 차이 요약")
+        diff_md = summarize_json_diff(raw_view, final_json)
+        st.markdown(diff_md)
+
+
+
+# --- 영어 검수 탭 ---
+with tab_en:
+    st.subheader("영어 텍스트 검수")
+    default_en = "This is a simple understaning of the Al model."
+    text_en = st.text_area(
+        "English text input",
+        value=default_en,
+        height=220,
+    )
+
+    if st.button("영어 검수 실행", type="primary"):
+        if not text_en.strip():
+            st.warning("먼저 영어 텍스트를 입력해주세요.")
+        else:
+            with st.spinner("AI가 영어 텍스트를 검수 중입니다..."):
+                result = review_english_text(text_en)
+
+            st.session_state["en_result"] = result
+
+    if "en_result" in st.session_state:
+        result = st.session_state["en_result"]
+        score = result.get("score", 1)
+
+        raw_json = result.get("raw", {}) or {}
+
+        # 🔹 final: 영어 단일 텍스트에 필요한 필드만
+        final_json = {
+            "suspicion_score": result.get("score", 1),
+            "content_typo_report": result.get("content_typo_report", ""),
+        }
+
+        # 🔹 raw도 동일 키만 추려서 보기 좋게
+        raw_view = {
+            "suspicion_score": raw_json.get("suspicion_score"),
+            "content_typo_report": raw_json.get("content_typo_report", ""),
+        }
+
+        st.success("영어 검수가 완료되었습니다!")
+        st.metric("Suspicion score (1~5)", f"{score:.2f}")
+
+        st.markdown("### 🔍 결과 비교 (Raw vs Final)")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("#### ✅ Final JSON (영어 입력 기준 최소 필드)")
+            st.json(final_json)
+
+        with col2:
+            st.markdown("#### 🧪 Raw JSON (동일 필드만 발췌)")
+            st.json(raw_view)
+
+        st.markdown("#### 🔍 Raw vs Final 차이 요약")
+        diff_md = summarize_json_diff(raw_view, final_json)
+        st.markdown(diff_md)
+
+
+
+
+# --- 시트 검수 탭 ---
 with tab_sheet:
     st.subheader("📄 Google Sheets 시트 검수")
 
     spreadsheet_name = st.text_input(
         "스프레드시트 이름",
-        value="[DATA] Paragraph DB (교과서 / 참고서 / 모의고사)",  # 네가 자주 쓰는 이름으로 기본값 설정
+        value="[DATA] Paragraph DB (교과서 / 참고서 / 모의고사)",
     )
 
     worksheet_name = st.text_input(
@@ -253,88 +562,165 @@ with tab_sheet:
         value="22개정 / 최종데이터",
     )
 
-    if st.button("이 시트 검수 실행", type="primary"):
+    # 🔹 1) 실행 버튼
+    run_clicked = st.button("이 시트 검수 실행", type="primary")
+
+    # 🔹 2) 버튼 눌렀을 때만 실제 검수 실행 + progress 표시
+    if run_clicked:
         if not spreadsheet_name.strip() or not worksheet_name.strip():
             st.warning("스프레드시트 이름과 탭 이름을 모두 입력해주세요.")
         else:
+            # 진행도 UI
+            progress_bar = st.progress(0.0)
+            progress_text = st.empty()
+
+            def progress_callback(done: int, total: int):
+                ratio = done / total if total > 0 else 0
+                remaining = total - done
+                progress_bar.progress(ratio)
+                progress_text.text(
+                    f"진행도: {done} / {total} 행 처리 완료 (남은 행: {remaining})"
+                )
+
             with st.spinner("시트 검수 중입니다... (행이 많으면 시간이 걸려요)"):
                 try:
-                    summary = run_sheet_review(spreadsheet_name, worksheet_name)
+                    summary = run_sheet_review(
+                        spreadsheet_name,
+                        worksheet_name,
+                        collect_raw=True,
+                        progress_callback=progress_callback,
+                    )
                 except Exception as e:
                     st.error(f"실행 중 오류가 발생했습니다: {e}")
                 else:
-                    st.success("시트 검수가 완료되었습니다!")
-                    st.metric("전체 행 수", summary.get("total_rows", 0))
-                    st.metric("검수 대상 행 수 (STATUS=1. AI검수요청)", summary.get("target_rows", 0))
-                    st.metric("실제 처리된 행 수", summary.get("processed_rows", 0))
-                    st.info("Google Sheets에서 SCORE / *_REPORT / STATUS 컬럼을 확인해주세요.")
+                    # 진행바 100%
+                    progress_bar.progress(1.0)
+                    progress_text.text("진행도: 모든 대상 행 처리 완료 ✅")
+
+                    # ✅ 결과를 SessionState에 저장
+                    st.session_state["sheet_summary"] = summary
+                    st.session_state["raw_results"] = summary.get("raw_results", [])
+
+    # 🔹 3) 여기부터는 "버튼을 누른 적이 있다면" 저장된 결과를 항상 다시 보여준다.
+    summary = st.session_state.get("sheet_summary")
+    raw_results = st.session_state.get("raw_results", [])
+
+    if summary:
+        total_rows = summary.get("total_rows", 0)
+        target_rows = summary.get("target_rows", 0)
+        processed_rows = summary.get("processed_rows", 0)
+        remaining_rows = max(target_rows - processed_rows, 0)
+
+        st.success("시트 검수가 완료되었습니다! (마지막 실행 기준)")
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        with col_m1:
+            st.metric("전체 행 수", total_rows)
+        with col_m2:
+            st.metric("검수 대상 행 수", target_rows)
+        with col_m3:
+            st.metric("실제 처리된 행 수", processed_rows)
+        with col_m4:
+            st.metric("남은 행 수", remaining_rows)
+
+        st.info("Google Sheets에서 SCORE / *_REPORT / STATUS 컬럼을 확인해주세요.")
+
+    st.markdown("### 🐞 디버그: 특정 행의 Raw / Final JSON & Diff")
+
+    if not raw_results:
+        st.info("아직 raw 결과가 없습니다. 먼저 시트 검수를 실행해주세요.")
+    else:
+        # 시트 실제 행 번호 리스트 (2,3,4,...)
+        row_numbers = [item["sheet_row_index"] for item in raw_results]
+
+        # 🔹 selectbox는 단순히 session_state에 '후보'를 저장
+        st.selectbox(
+            "Raw/Final JSON을 보고 싶은 행 번호를 선택하세요:",
+            options=row_numbers,
+            key="selected_row_candidate",
+            format_func=lambda x: f"행 {x}번",
+        )
+
+        # 🔹 이 버튼을 눌렀을 때만 실제로 반영
+        if st.button("이 행의 JSON 보기"):
+            st.session_state["selected_row"] = st.session_state["selected_row_candidate"]
+
+        selected_row = st.session_state.get("selected_row")
+
+        if selected_row is not None:
+            selected_item = next(
+                (item for item in raw_results if item["sheet_row_index"] == selected_row),
+                None,
+            )
+
+            if selected_item:
+                col_final, col_raw = st.columns(2)
+
+                with col_final:
+                    st.markdown(f"#### ✅ Final JSON (행 {selected_row})")
+                    st.json(selected_item.get("final"))
+
+                with col_raw:
+                    st.markdown(f"#### 🧪 Raw JSON (행 {selected_row})")
+                    st.json(selected_item.get("raw"))
+
+                # Diff 요약
+                st.markdown("#### 🔍 Raw vs Final 차이 요약")
+                diff_md = summarize_json_diff(
+                    selected_item.get("raw"),
+                    selected_item.get("final"),
+                )
+                st.markdown(diff_md)
+            else:
+                st.info("선택한 행의 Raw/Final 데이터가 없습니다.")
 
 
-with tab_main:
-    st.subheader("검수할 텍스트를 입력하세요")
-    default_text = "이것은 테스트 문장 입니다. 그는는 학교에 갔다."
-    text = st.text_area(
-        "입력 텍스트",
-        value=default_text,
-        height=220,
-        help="한국어 텍스트를 넣어주세요.",
-    )
 
-    if st.button("검수 실행", type="primary"):
-        if not text.strip():
-            st.warning("먼저 텍스트를 입력해주세요.")
-        else:
-            with st.spinner("AI가 검수 중입니다..."):
-                result = review_text(text)
-
-            score = result.get("score")
-            content_report = result.get("content_typo_report")
-
-            st.success("검수가 완료되었습니다!")
-
-            if score is not None:
-                st.metric("의심 점수 (1~5)", f"{score:.2f}")
-
-            st.markdown("### 🔍 리포트")
-
-            with st.expander("📄 입력 텍스트 검수 결과 리포트 (content_typo_report)"):
-                if content_report.strip():
-                    st.markdown(content_report)
-                else:
-                    st.info("보고할 오류가 없습니다.")
-
-
+# --- 설명 탭 ---
 with tab_about:
     st.markdown("""
 ## 이 앱은?
 
-- 텍스트 검수에 대한 통합 버전을 만들기 위한 기초 streamlit입니다.
+- 한국어/영어 **단일 텍스트 검수기** + **Google Sheets 기반 배치 검수기**입니다.
+- 스타일/어투/자연스러움은 건드리지 않고, **오탈자 / 조사 / 띄어쓰기 / 기본 문장부호 / 단순 스펠링 오류**에만 집중합니다.
 
-### 텍스트 검수
+### 탭 설명
 
-- 한글 텍스트를 기입하면 AI를 통해 검수를 진행합니다.
-- 아직 테스트 중으로 정확하게 잡아내진 못할 수 있으니 **주의**해주세요!
+- **✏️ 한국어 검수**: 한국어 문장/문단 하나를 넣으면,
+  - 형태소 분리 오류(예: `된 다`, `묻 는`)
+  - 반복 오타(예: `된다따따.`)
+  - 조사/어미/띄어쓰기 오류
+  - 따옴표 짝 불일치
+  등을 중심으로 검수합니다.
+  
+  ** 12/4 업데이트 내용**
+  - 모델이 실제 검수한 결과와, 필터링 되어서 나오는 결과를 비교할 수 있게 됐어요.
+  - 간혹 과하게 검수가 된 경우도 있으니 참고해주세요.
 
-### 시트 검수 (영어 AI 검수)
+- **✏️ 영어 검수**: 영어 문장/문단 하나를 넣으면,
+  - 스펠링 typo (예: `understaning` → `understanding`)
+  - 중복 단어 (`the the`)
+  - 잘못된 띄어쓰기 (`re turn` → `return`)
+  - AI 문맥에서 `Al` → `AI` 오타
+  등을 중심으로 검수합니다.
+  
+   ** 12/4 업데이트 내용**
+  - 모델이 실제 검수한 결과와, 필터링 되어서 나오는 결과를 비교할 수 있게 됐어요.
+  - 간혹 과하게 검수가 된 경우도 있으니 참고해주세요.
 
-- Gemini를 활용한 영어 원지문 AI 검수기입니다.
-- **Gemini API + Streamlit**으로 감싼 텍스트 검수기입니다.
-- 현재 버전은 "시트명 + 탭명" 기입을 기반으로 자동하는 것이 주 용도입니다.
-
-### 동작
-
-1. 사용자는 시트 검수 탭으로 이동해주세요.
-2. 스프레드시트 이름과 탭명을 기입해주세요.
-3. 기입 완료 후 **이 시트 검수 실행**을 눌러주세요.
-4. 요청 행이 많으면 시간이 조금 걸릴 수 있어요.
-5. 실행이 완료되면 **시트**로 이동해서 결과를 확인해주세요.
-
-
-### score 정의
-
-- 1: 오류 없음  
-- 2~3: 소수의 명확한 오류  
-- 4~5: 다수의 오류 또는 품질 매우 의심 
+- **📄 시트 검수**: Google Sheets에 있는
+  - 영어 원문 / 마크다운
+  - 한국어 번역 / 마크다운
+  을 row 단위로 읽어서, 시트에 SCORE / *_REPORT / STATUS를 채워넣습니다.
+  
+  **[12/4] 업데이트 내용**
+  - 시트에서 검수하고 있는 진행 상태를 볼 수 있어요.
+  - 실행된 행을 Select box에서 골라서 검수 내역을 확인할 수 있어요.
+  - 모델이 준 결과와 필터링된 결과를 비교할 수 있어요.
 """)
+
+
+# --- 디버그 탭 ---
 with tab_debug:
-    st.markdown("여기는 나중에 raw JSON을 보는 용도로 쓸 수 있습니다. (현재는 입력 후 콘솔 등으로 확인)")
+    st.markdown("여기는 추후에 로그, 디버그용 정보를 추가로 표시할 수 있는 영역입니다.")
+    
+    

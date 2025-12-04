@@ -61,27 +61,190 @@ def create_review_prompt(row: dict) -> str:
     translation_md = row.get(TRANSLATION_MD_COL, "")
 
     prompt = f"""
-    You are a machine-like **Data Verifier**. Your ONLY job is to find **objective, factual errors**. You are strictly forbidden from judging style, meaning, or making subjective suggestions. Your output MUST BE a single, valid JSON object.
+    You are a machine-like **Data Verifier**. Your ONLY job is to find **objective, factual errors** 
+    in both the English source text and the Korean translated text. 
+    You are strictly forbidden from judging style, meaning, or making subjective suggestions. 
+    Your output MUST BE a single, valid JSON object.
 
-    **Definition of "Objective Error":**
-    You must only report the following:
-    1.  **Typos:** Clearly misspelled words (e.g., "recieve" -> "receive", "이점들을를" -> "이점들을").
-    2.  **Grammatical Errors:** Incorrect particles, endings, or spacing (e.g., "사과을" -> "사과를").
-    3.  **Content Mismatch:** Verifiable differences between plain text and markdown versions (e.g., a word is missing in the markdown).
+    Your JSON MUST have exactly the following keys:
+    - "suspicion_score": an integer between 1 and 5 (1 = almost certainly no error, 5 = very likely serious errors)
+    - "content_typo_report": a string (may be empty "")
+    - "translated_typo_report": a string (may be empty "")
+    - "markdown_report": a string (may be empty "")
 
-    **CRITICAL RULES OF ENGAGEMENT:**
-    1.  **ABSOLUTELY NO STYLISTIC FEEDBACK:** Do not suggest alternative wording (e.g., "근사한" vs "멋있는"). Do not comment on what sounds "more natural" or "more appropriate". This is a critical failure.
-    2.  **SILENCE ON PERFECTION:** If no objective errors are found, the report field MUST be an empty string (`""`). Do not write "오류 없음".
-    3.  **RESPECT STYLING CONVENTIONS:** It is CORRECT for *italicized English* to be represented with `'single quotes'` or `《double angle brackets》` in Korean. This is NOT an error.
-    4.  **GROUND YOUR FINDINGS:** When reporting an error, you MUST quote the problematic text.
-    5.  **NO IDENTICAL CORRECTIONS:** A suggested correction must be different from the original text.
-    6. **Morpheme Split Errors:** If a verb, adjective, ending, or particle that must remain a single morpheme is incorrectly split, it must always be treated as an error. 
-   Examples: "묻 는", "먹 는", "잡 아"
-   However, spacing cases where both forms are officially acceptable in Korean orthography 
-   (e.g., "해 보다" / "해보다") must be excluded from error detection.
+    Use the fields as follows:
+    - **content_typo_report**: objective errors in the **English source text** (plain_english / markdown_english).
+    - **translated_typo_report**: objective errors in the **Korean translated text** (plain_korean / markdown_korean).
+    - **markdown_report**: pure **markdown vs plain-text mismatches** (missing words, extra words, broken formatting) 
+      for either English or Korean.
+
     ---
 
-    **ANALYSIS WORKFLOW:**
+    ## 1. What counts as an objective error?
+
+    You must ONLY report the following error types.
+
+    ### 1-A. For English (plain_english / markdown_english)
+
+    1. **Spelling / Typos (VERY IMPORTANT)**
+       - Any obviously misspelled English word MUST be treated as an error,
+         not only specific examples.
+       - Treat a token as a spelling typo if:
+         - It is very similar to a common English word (1–2 letters missing, added, swapped, or wrong),
+           AND
+         - It is not clearly a proper noun, acronym, variable name, or chemical formula.
+       - Examples (these are patterns, NOT an exhaustive list):
+         - "recieve"  → "receive"
+         - "enviroment" → "environment"
+         - "understaning" → "understanding"
+         - "langauge" → "language"
+         - "teh" → "the"
+         - "problme" → "problem"
+
+       - Counter-examples (DO NOT mark these as spelling errors):
+         - Proper nouns or product names: "OpenAI", "ChatGPT", "PyTorch"
+         - Technical tokens / code / formulas: "int64", "Al2O3", "NaCl"
+
+    2. **Obvious spacing / duplication errors**
+       - Accidental extra spaces inside a word, or duplicated words.
+       - Examples:
+         - "re turn" → "return"
+         - "the the" → "the"
+
+       3. **AI vs Al typo in AI-related context**
+       - In contexts clearly about artificial intelligence (e.g. "model", "system", "tool",
+         "chatbot", "LLM", "agent", "neural network"), the token "Al"
+         (capital A + lowercase L) is almost always a typo for "AI".
+       - In such contexts, you MUST treat "Al" as a spelling error and correct it to "AI".
+       - Examples:
+         - "Al model"   → "AI model"
+         - "modern Al technology" → "modern AI technology"
+         - "Al chatbot" → "AI chatbot"
+
+    4. **Plain vs Markdown content mismatch (English)**
+       - A word or phrase is missing in markdown, duplicated, or obviously wrong compared to the plain version.
+       - Example:
+         - plain_english: "He went to school yesterday."
+         - markdown_english: "He went school yesterday."
+         → Missing "to" is an objective mismatch.
+
+    ### 1-B. For Korean (plain_korean / markdown_korean)
+
+    1.  **Typos (오탈자)**  
+        - 잘못된 철자, 중복 글자, 명백한 입력 실수  
+        - 예: "이점들을를" → "이점들을"
+
+    2.  **Grammatical Errors (조사, 어미)**  
+        - 주격/목적격/보격/부사격 조사 잘못 사용  
+        - 동사/형용사 어미가 문법적으로 분명히 잘못된 경우  
+        - 예: "사과을" → "사과를"
+
+    3.  **Spacing (띄어쓰기) errors**  
+        - 띄어쓰기/붙여쓰기 규범이 명백히 잘못된 경우  
+        - 예: "책을읽고" → "책을 읽고"
+
+    4.  **Basic punctuation (기본 문장부호) errors**  
+        - 마침표/쉼표/물음표 등 필수 문장부호가 빠져
+          문장이 비문이 되거나 구조가 심각하게 모호한 경우.
+        - 따옴표/쌍따옴표가 한쪽만 있거나 짝이 안 맞는 경우는 **항상 오류**이다.
+        - 문단 첫 번째 문장에서는 문장 부호 누락 여부를 특히 주의해서 확인한다.
+        - 예:
+          - 잘못된 예: 나는 말한다."
+          - 올바른 예: "나는 말한다."
+
+    5.  **Morpheme Split Errors (형태소 분리 오류)**  
+        - 동사, 형용사, 어미, 조사 등 하나의 형태소로 결합되어야 하는 항목이 
+          부적절하게 분리된 경우는 **무조건 오류**로 판단한다. 
+        - 예:
+          - "묻 는" → "묻는"
+          - "먹 는" → "먹는"
+          - "잡 아" → "잡아"
+          - "된 다" → "된다"
+          - "간 다" → "간다"
+        - 단, 한국어 맞춤법에서 두 형태 모두 허용되는 띄어쓰기(예: "해 보다"/"해보다")는 제외한다.
+
+    6.  **Repetition Typos (반복 오타)**  
+        - 유효한 한국어 단어를 이루지 못하는 음절/글자 반복은 **항상 오타**로 판단한다.
+        - 예:
+          - "된다따따." → "된다."
+          - "합니다아아" → "합니다."
+          - "간다다다" → "간다."
+
+    7.  **Plain vs Markdown content mismatch (Korean)**  
+        - plain_korean과 markdown_korean 사이에 단어가 빠지거나, 잘못 추가되거나, 
+          명백히 다른 내용이 있을 때만 보고한다.
+
+    ---
+
+    ## 2. CRITICAL RULES OF ENGAGEMENT (for BOTH English and Korean)
+
+    1.  **ABSOLUTELY NO STYLISTIC FEEDBACK:** 
+        Do NOT suggest alternative wording (e.g., "근사한" vs "멋있는", 
+        "big" vs "large"). Do not comment on what sounds "more natural" or "more appropriate". 
+        This is a critical failure.
+
+    2.  **SILENCE ON PERFECTION:** 
+        If no objective errors are found for a given field, its report MUST be an empty string (`""`). 
+        Do not write phrases like "오류 없음", "문제 없음", "정상", "no issues", etc.
+
+    3.  **RESPECT STYLING CONVENTIONS:** 
+        It is CORRECT for *italicized English* to be represented with 'single quotes' or 《double angle brackets》 
+        in Korean. This is NOT an error.
+
+    4.  **GROUND YOUR FINDINGS:** 
+        When reporting an error, you MUST quote the problematic text and provide the corrected form.
+
+    5.  **NO IDENTICAL CORRECTIONS:** 
+        A suggested correction must be different from the original text.
+
+    ---
+
+    ## 3. EXAMPLES OF CORRECT EXECUTION
+
+    **Example: English typo**
+    - plain_english: "We can easily understaning the data."
+    - Correct JSON (excerpt):
+    {{
+        "content_typo_report": "- 'understaning' is a spelling mistake. It must be 'understanding'.",
+        ...
+    }}
+
+    **Example: AI vs Al typo**
+    - plain_english: "Our Al model learns from data."
+    - Correct JSON (excerpt):
+    {{
+        "content_typo_report": "- In 'Al model', 'Al' is a typo in an AI context. It must be 'AI model'.",
+        ...
+    }}
+
+    **Example: Korean repetition typo**
+    - plain_korean: "된다따따."
+    - Correct JSON (excerpt):
+    {{
+        "translated_typo_report": "- '된다따따.'에서 불필요한 반복 '따따'가 있음. '된다.'로 수정해야 함.",
+        ...
+    }}
+
+    **Example: Korean morpheme split**
+    - plain_korean: "그렇게 된 다."
+    - Correct JSON (excerpt):
+    {{
+        "translated_typo_report": "- '된 다'에서 형태소 분리 오류. '된다'로 붙여 써야 함.",
+        ...
+    }}
+
+    **Example: Unbalanced quotes**
+    - plain_korean: 나는 말한다."
+    - Correct JSON (excerpt):
+    {{
+        "translated_typo_report": "- 따옴표가 한쪽만 있음. '\"나는 말한다.\"'처럼 시작과 끝을 모두 써야 함.",
+        ...
+    }}
+
+    ---
+
+    ## 4. ANALYSIS WORKFLOW
+
     Now, apply these strict rules and examples to the following data.
 
     **Data to Review:**
@@ -174,13 +337,28 @@ def validate_and_clean_analysis(result: dict) -> dict:
 # 4. 공개 함수: 시트 전체를 돌리고 요약 리턴
 # ---------------------------------------------------
 
-def run_sheet_review(spreadsheet_name: str, worksheet_name: str) -> dict:
+def run_sheet_review(spreadsheet_name: str,
+                     worksheet_name: str,
+                     collect_raw: bool = False, 
+                     progress_callback=None,) -> dict:
     """
     - 주어진 스프레드시트 / 워크시트에서
     - STATUS == '1. AI검수요청' 인 행만 골라서
     - SCORE / *_REPORT / STATUS를 채워넣는다.
 
-    반환값: {"total_rows": ..., "target_rows": ..., "processed_rows": ...}
+    반환값: {
+      "total_rows": ...,
+      "target_rows": ...,
+      "processed_rows": ...,
+      "raw_results": [  # collect_raw=True일 때만
+          {
+            "sheet_row_index": int,
+            "raw": {...},      # validate 전 원본 JSON
+            "final": {...},    # validate_and_clean_analysis 이후
+          },
+          ...
+      ]
+    }
     """
     try:
         spreadsheet = gs_client.open(spreadsheet_name)
@@ -202,14 +380,23 @@ def run_sheet_review(spreadsheet_name: str, worksheet_name: str) -> dict:
             "total_rows": len(df),
             "target_rows": 0,
             "processed_rows": 0,
+            "raw_results": [],
         }
 
     results = []
+    raw_results = []  # 🔹 디버그용
 
-    for _, row in targets.iterrows():
+    total_targets = len(targets)
+
+
+    for i, (_, row) in enumerate(targets.iterrows(), start=1):
         row_dict = row.to_dict()
         row_idx = row["sheet_row_index"]
-        print(f"행 {row_idx} 검수 중...")
+        print(f"행 {row_idx} 검수 중... ({i}/{total_targets})")
+        
+        if progress_callback is not None:
+            # progress_callback(처리한 개수, 전체 개수)
+            progress_callback(i, total_targets)
 
         prompt = create_review_prompt(row_dict)
         raw = analyze_text_with_gemini(prompt)
@@ -225,6 +412,16 @@ def run_sheet_review(spreadsheet_name: str, worksheet_name: str) -> dict:
                 STATUS_COL: "2. AI검수완료",
             }
         )
+        
+         # 스트림릿에서 볼 raw 디버그용
+        if collect_raw:
+            raw_results.append(
+                {
+                    "sheet_row_index": row_idx,
+                    "raw": raw,
+                    "final": final,
+                }
+            )
 
         time.sleep(0.5)  # API 과다 호출 방지용 (필요시 조정)
 
@@ -255,4 +452,6 @@ def run_sheet_review(spreadsheet_name: str, worksheet_name: str) -> dict:
         "total_rows": len(df),
         "target_rows": len(targets),
         "processed_rows": len(results),
+        "raw_results": raw_results,   # 🔹 여기 추가
+
     }
