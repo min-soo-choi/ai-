@@ -184,6 +184,36 @@ If there is nothing to report, each report field MUST be an empty string "" (do 
      - "된다따따." → "된다."
      - "합니다아아" → "합니다."
      - "간다다다" → "간다."
+     
+7. **마침표 ↔ 쉼표 오용 (MUST ALWAYS FLAG)**  
+
+한국어에서도 다음은 모두 **명백한 문장부호 오류**임:
+
+### 1) 마침표가 들어가야 하는데 쉼표를 사용한 경우  
+예:  
+- "나는 오늘 학교에 갔다, 그리고 집에 왔다."  
+→ "나는 오늘 학교에 갔다. 그리고 집에 왔다."
+
+### 2) 쉼표가 들어가야 하는데 마침표를 사용한 경우  
+예:  
+- "나는 밥을 먹었다. 그리고 물을 마셨다."  
+(이건 자연스럽지만)  
+- "나는 밥을 먹었다. 그리고"  
+→ 문장 구조가 불완전 → 오류
+
+### 3) 쉼표로 두 문장을 억지로 연결한 경우 (Comma splice)  
+예:  
+- "비가 온다, 나는 우산을 쓴다."  
+→ "비가 온다. 나는 우산을 쓴다."
+
+### 4) 문장 끝에 쉼표가 있는 경우  
+예:  
+- "나는 간다," → "나는 간다."
+
+### 5) 연결 어미 앞에서 잘못된 구두점  
+예:  
+- "나는 간다. 그리고 학교에 간다."  
+→ ‘그리고’ 앞에서는 마침표 대신 쉼표가 더 적절한 문장 구조 → 오류로 처리
 
 ---
 
@@ -237,129 +267,179 @@ def review_korean_text(korean_text: str) -> dict:
 # --------------------------
 def create_english_review_prompt_for_text(english_text: str) -> str:
     """
-    영어 텍스트(문장/문단) 하나만 검수하는 프롬프트.
-    - 스펠링 / 단어 반복 / 잘못된 띄어쓰기 / AI ↔ Al 오타 / 문장부호 / 대문자 규칙
-    - ⚠ 모든 리포트는 한국어로 작성해야 한다.
+    영어 단일 문장/문단을 검수하는 완전 강화 프롬프트.
+    - 스펠링 / AI↔Al 오타 / 대문자 규칙 / 쉼표↔마침표 오용 / 기본 문장부호 / 공백 오류 / 중복 단어
+    - 모든 리포트는 한국어로 작성해야 한다.
     """
     prompt = f"""
 You are a machine-like **English text proofreader**.
 Your ONLY job is to detect **objective, verifiable errors** in the following English text.
-You are strictly forbidden from judging tone, style, naturalness, or suggesting alternative phrasing.
+You are strictly forbidden from suggesting stylistic improvements, rewriting, rephrasing, or judging naturalness.
 
-Your response MUST be a valid JSON object with exactly these keys:
+Your output MUST be a single valid JSON object:
+
 - "suspicion_score": integer (1~5)
 - "content_typo_report": string
-- "translated_typo_report": string
-- "markdown_report": string
+- "translated_typo_report": string (always "")
+- "markdown_report": string (always "")
 
-All explanations in the *_report fields MUST be written in **Korean**.
+All explanation MUST be in **Korean**, never English.
 
-If nothing is wrong, each report field MUST be an empty string "".
-
----
-
-# 1. Objective Error Rules (You MUST follow ALL of these)
-
-## (A) Spelling / Typo Errors (MUST detect)
-A token MUST be treated as a spelling error if:
-1. It is similar to a valid English word (1–2 letters wrong/missing/swapped), AND
-2. It is not a proper noun, acronym, or technical token.
-
-Examples (patterns, not a full list):
-1. recieve → receive
-2. enviroment → environment
-3. understaning → understanding
-4. langauge → language
-5. problme → problem
-6. definately → definitely
-7. seperated → separated
-8. occured → occurred
-9. adress → address
-10. wierd → weird
-
-Always treat these patterns as typos:
-- Missing vowel (sytem → system)
-- Letter swap (teh → the)
-- Double-letter confusion (comming → coming)
-- Incorrect ending (becuase → because)
+If no errors exist, all *_report fields MUST be empty strings "".
 
 ---
 
-## (B) AI 문맥에서 Al → AI (MUST ALWAYS FLAG)
-If the sentence is about artificial intelligence (model, system, tool, LLM, agent, chatbot):
-- “Al” (A + lowercase L) MUST be treated as a typo for “AI”.
+# 1. 반드시 감지해야 할 영어 오류 규칙 (ABSOLUTE REQUIREMENTS)
+
+## (A) **Spelling / Typo Errors (MUST detect ALL)**
+
+You MUST treat a token as a spelling error if:
+
+1. It is very similar to a valid English word  
+   (1–2 letters missing, added, swapped, or wrong), AND  
+2. It is NOT a proper noun, acronym, technical token, filename, or code.
+
+Examples (patterns, NOT an exhaustive list):
+
+1. recieve → receive  
+2. enviroment → environment  
+3. understaning → understanding  
+4. langauge → language  
+5. problme → problem  
+6. definately → definitely  
+7. seperated → separated  
+8. occured → occurred  
+9. adress → address  
+10. wierd → weird  
+11. becuase → because  
+12. comming → coming  
+13. teh → the  
+14. sytem → system  
+
+MUST ALWAYS FLAG lower-case “i” used for the pronoun “I”.
+
+❗ 예시 문장 분석:
+- "This is a simple understaning of the AI model."  
+  → MUST detect understaning → understanding
+
+---
+
+## (B) **AI 문맥에서 Al → AI (MUST ALWAYS FLAG)**
+
+If the sentence clearly refers to artificial intelligence (model, system, learning, LLM, agent, chatbot):
+
+- “Al” (A + lowercase L) MUST be treated as a typo of “AI”.
 
 Examples:
-- Al model → AI model
-- Al system → AI system
+- Al model → AI model  
+- modern Al technology → modern AI technology  
+- Al system learns → AI system learns  
 
 ---
 
-## (C) Capitalization Errors (MUST FLAG)
-These MUST be treated as objective errors:
-- Sentence beginning with lowercase letter  
-  → e.g. “al i do…” MUST be corrected to “Al I do…”
-- Pronoun “I” in lowercase  
-  → “i do not…” MUST be corrected to “I do not…”
-- Proper nouns clearly wrong  
-  → london → London
+## (C) **Capitalization Errors (MUST detect)**
+
+You MUST flag:
+1. Sentence starting with lowercase  
+   - “this is…” → “This is…”
+2. Pronoun “I” in lowercase  
+   - “i do not” → “I do not”
+3. Proper nouns without capitalization  
+   - “london” → “London”
+   - “korea” → “Korea”
 
 ---
 
-## (D) Basic punctuation errors (MUST FLAG)
-- Missing period at end of a sentence  
-- Run-on sentence without punctuation  
-- Broken quotation marks  
-- Two sentences joined without a period
+## (D) **Basic punctuation errors (MUST detect)**
 
-Examples:
-- This is wrong  
-- He said "Hello.  
-- I went home he slept.
+You MUST detect:
 
----
-
-## (E) Spacing / duplication errors (MUST FLAG)
-- "re turn" → "return"
-- "the the" → "the"
-- "mod el" → "model"
+1. Missing period at the end of a full sentence  
+2. Missing comma after introductory elements  
+3. Broken quotation marks  
+4. Two sentences joined without punctuation  
+5. Double punctuation (“..”), wrong punctuation marks (!?, ?!, ,.)  
 
 ---
 
-# 2. Output style (IMPORTANT)
-- All reports MUST be in Korean.
-- Each error MUST follow this format:
+## (E) **Period ↔ Comma Misplacement (MUST detect ALL cases)**
 
-"- 'understaning' → 'understanding': 'understaning'은 철자 오타이며, 'understanding'으로 수정해야 합니다."
+You MUST flag:
 
-If there is NO objective error:
-- suspicion_score = 1
-- all reports = ""
+### 1) 쉼표가 마침표 자리에서 사용됨
+- "He is here, This is wrong."  
+  → Should be two sentences.
+
+### 2) 마침표가 쉼표 자리에서 사용됨  
+- "He slept. and I worked."  
+  → Should be “He slept, and I worked.”
+
+### 3) **Comma splice** (MUST flag always)
+- “I finished the task, It was easy.”  
+  → MUST treat as an objective grammar error.
+
+### 4) Sentence-ending comma
+- "He is here,"  
+  → Should be “He is here.”
+
+### 5) Incorrect punctuation before conjunction  
+- “I ate lunch. and I left.”  
+  → Must be a comma, not a period.
+
+---
+
+## (F) **Spacing / duplication errors (MUST detect)**
+
+- “re turn” → “return”  
+- “mod el” → “model”  
+- “the the” → “the”  
+- “AI  model” (double space) → “AI model”  
+
+---
+
+## (G) **Markdown mismatch**  
+Always flag if markdown text differs from plain text.
+
+---
+
+# 2. Output Format Rules (VERY IMPORTANT)
+
+- All reports MUST be written in Korean.
+- Each bullet MUST follow the format:
+
+“- 'wrong' → 'correct': 'wrong'은(는) ~ 오류이며, 'correct'로 수정해야 합니다.”
+
+- suspicion_score =  
+  - 1 → 오류 없음  
+  - 2~3 → 경미한 오류  
+  - 4~5 → 다수 또는 심각한 오류  
 
 ---
 
 # 3. Text to review
+
 plain_english: "{english_text}"
 markdown_english: "{english_text}"
 
+---
 
-## 4. Self-check example (MUST follow)
+# 4. Self-check requirement (MUST FOLLOW)
 
-For the sentence:
-"This is a simple understaning of the AI model."
+If the input contains ANY of the following:
 
-A CORRECT JSON OUTPUT EXAMPLE (do NOT copy, just follow the same logic) is:
+- understaning  
+- langauge  
+- problme  
+- Al model  
+- i do not  
+- He slept. and I worked.  
+- This is wrong, This is wrong.
 
-{{
-  "suspicion_score": 3,
-  "content_typo_report": "- 'understaning' → 'understanding': 'understaning'은 'understanding'의 철자 오타이므로 'understanding'으로 수정해야 합니다.",
-  "markdown_report": ""
-}}
-
-If the input text contains the word "understaning", you MUST always treat it as a spelling error of "understanding".
+You MUST ALWAYS flag them as objective errors.
 
 """
     return prompt
+
 
 
 
@@ -371,7 +451,7 @@ def review_english_text(english_text: str) -> dict:
     cleaned = validate_and_clean_analysis(raw)
     return {
         "score": cleaned.get("suspicion_score"),
-        "content_typo_report": cleaned.get("content_typo_report", ""),
+        "영어 문장 검수 결과": cleaned.get("content_typo_report", ""),
         "markdown_report": cleaned.get("markdown_report", ""),
         "raw": raw,  # 디버깅용
     }
@@ -410,6 +490,92 @@ def summarize_json_diff(raw: dict | None, final: dict | None) -> str:
 
     return "\n".join(lines)
 
+def extract_korean_suggestions_from_raw(raw: dict) -> list[str]:
+    """
+    raw JSON 전체에서 오류 설명을 추출하여 bullet list로 변환한다.
+    포함 대상:
+    - translated_typo_report
+    - content_typo_report
+    - markdown_report (한국어 오류 관련 내용이 있을 때만)
+    """
+
+    if not isinstance(raw, dict):
+        return []
+
+    collected = []
+
+    # 1️⃣ 한국어 오류가 들어가는 주요 보고 필드들
+    fields = [
+        raw.get("translated_typo_report", ""),
+        raw.get("content_typo_report", ""),
+        raw.get("markdown_report", ""),
+    ]
+
+    for block in fields:
+        if not block:
+            continue
+        
+        # 각 필드 내 줄 단위 추출
+        for line in block.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+
+            # bullet 없는 라인도 bullet 형태로 정규화
+            if not line.startswith("- "):
+                line = f"- {line}"
+
+            collected.append(line)
+
+    return collected
+
+
+
+def extract_english_suggestions_from_raw(raw: dict) -> list[str]:
+    """
+    raw JSON 전체에서 '영어 원문'에 대한 오류 설명을 추출하여
+    bullet 리스트로 변환한다.
+
+    포함 대상 필드:
+    - content_typo_report: 영어 원문(English) 관련 오류 설명 (한국어로 기술)
+    - translated_typo_report: 예외적으로 영어 관련 내용이 들어갈 수도 있어 보조로 포함
+    - markdown_report: 마크다운 변환 과정에서 발생한 영어 텍스트 오류가 있을 수 있음
+
+    반환 형식:
+    - 각 요소는 반드시 '- '로 시작하는 한 줄짜리 문자열
+    """
+    if not isinstance(raw, dict):
+        return []
+
+    collected: list[str] = []
+
+    # 1️⃣ 영어 원문 쪽 오류가 담길 수 있는 필드들
+    fields = [
+        raw.get("content_typo_report", ""),
+        raw.get("translated_typo_report", ""),
+        raw.get("markdown_report", ""),
+    ]
+
+    for block in fields:
+        if not block:
+            continue
+
+        # 각 필드를 줄 단위로 분해 후 정리
+        for line in block.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+
+            # 이미 "- "로 시작하지 않으면 bullet로 감싸기
+            if not line.startswith("- "):
+                line = f"- {line}"
+
+            collected.append(line)
+
+    return collected
+
+
+
 
 
 # --------------------------
@@ -431,7 +597,7 @@ tab_ko, tab_en, tab_sheet, tab_about, tab_debug = st.tabs(
 # --- 한국어 검수 탭 ---
 with tab_ko:
     st.subheader("한국어 텍스트 검수")
-    default_ko = "이것은 테스트 문장 입니다. 그는는 학교에 갔다."
+    default_ko = "이것은 테스트 문장 입니다, 그는.는 학교에 갔다,"
     text_ko = st.text_area(
         "한국어 텍스트 입력",
         value=default_ko,
@@ -445,7 +611,7 @@ with tab_ko:
             with st.spinner("AI가 한국어 텍스트를 검수 중입니다..."):
                 result = review_korean_text(text_ko)
 
-            # 최신 결과를 세션에 저장
+            # ✅ 최신 결과를 세션에 저장
             st.session_state["ko_result"] = result
 
     # ✅ 세션에 결과가 있으면 항상 아래를 보여줌
@@ -458,14 +624,14 @@ with tab_ko:
 
         # 🔹 final: 한국어 단일 텍스트에 필요한 필드만
         final_json = {
-            "suspicion_score": result.get("score", 1),
-            "translated_typo_report": result.get("translated_typo_report", ""),
+            "의심 점수": result.get("score", 1),
+            "한국어 검수 결과": result.get("translated_typo_report", ""),
         }
 
         # 🔹 raw도 비교 키만 슬림하게 잘라서 보기 좋게
         raw_view = {
-            "suspicion_score": raw_json.get("suspicion_score"),
-            "translated_typo_report": raw_json.get("translated_typo_report", ""),
+            "의심 점수": raw_json.get("suspicion_score"),
+            "한국어 검수 결과": raw_json.get("translated_typo_report", ""),
         }
 
         st.success("한국어 검수가 완료되었습니다!")
@@ -483,9 +649,23 @@ with tab_ko:
             st.markdown("#### 🧪 Raw JSON (동일 필드만 발췌)")
             st.json(raw_view)
 
+        # 🔍 Diff 요약
         st.markdown("#### 🔍 Raw vs Final 차이 요약")
         diff_md = summarize_json_diff(raw_view, final_json)
         st.markdown(diff_md)
+
+        raw = result.get("raw", {})
+        
+        # 🛠 최종 수정 제안 사항
+        st.markdown("### 🛠 최종 수정 제안 사항")
+        suggestions = extract_korean_suggestions_from_raw(raw)
+
+        if not suggestions:
+            st.info("보고할 수정 사항이 없습니다.")
+        else:
+            for s in suggestions:
+                st.markdown(f"- {s}")
+
 
 
 
@@ -516,14 +696,14 @@ with tab_en:
 
         # 🔹 final: 영어 단일 텍스트에 필요한 필드만
         final_json = {
-            "suspicion_score": result.get("score", 1),
-            "content_typo_report": result.get("content_typo_report", ""),
+            "의심 점수": result.get("score", 1),
+            "영어 검수 결과": result.get("content_typo_report", ""),
         }
 
         # 🔹 raw도 동일 키만 추려서 보기 좋게
         raw_view = {
-            "suspicion_score": raw_json.get("suspicion_score"),
-            "content_typo_report": raw_json.get("content_typo_report", ""),
+            "의심 점수": raw_json.get("suspicion_score"),
+            "영어 검수 결과": raw_json.get("content_typo_report", ""),
         }
 
         st.success("영어 검수가 완료되었습니다!")
@@ -544,6 +724,18 @@ with tab_en:
         st.markdown("#### 🔍 Raw vs Final 차이 요약")
         diff_md = summarize_json_diff(raw_view, final_json)
         st.markdown(diff_md)
+        
+        raw = result.get("raw", {})
+        
+         # 🛠 최종 수정 제안 사항
+        st.markdown("### 🛠 최종 수정 제안 사항 (영어 원문 기준)")
+        suggestions = extract_english_suggestions_from_raw(raw)
+
+        if not suggestions:
+            st.info("보고할 수정 사항이 없습니다.")
+        else:
+            for s in suggestions:
+                st.markdown(f"- {s}")
 
 
 
@@ -690,6 +882,7 @@ with tab_about:
   - 반복 오타(예: `된다따따.`)
   - 조사/어미/띄어쓰기 오류
   - 따옴표 짝 불일치
+  - 마침표, 쉼표 검수
   등을 중심으로 검수합니다.
   
   ** 12/4 업데이트 내용**
@@ -701,11 +894,12 @@ with tab_about:
   - 중복 단어 (`the the`)
   - 잘못된 띄어쓰기 (`re turn` → `return`)
   - AI 문맥에서 `Al` → `AI` 오타
+  - 마침표, 쉼표 검수
   등을 중심으로 검수합니다.
   
    ** 12/4 업데이트 내용**
-  - 모델이 실제 검수한 결과와, 필터링 되어서 나오는 결과를 비교할 수 있게 됐어요.
-  - 간혹 과하게 검수가 된 경우도 있으니 참고해주세요.
+  - 모델이 실제 검수한 결과와, 필터링 되어서 나오는 결과를 '비교'할 수 있게 됐어요.
+  - 간혹 '과하게 검수'가 된 경우도 있으니 참고해주세요.
 
 - **📄 시트 검수**: Google Sheets에 있는
   - 영어 원문 / 마크다운
