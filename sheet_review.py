@@ -51,18 +51,30 @@ gs_client = gspread.authorize(creds)
 
 STATUS_COL = "STATUS"
 ORIGINAL_TEXT_COL = "content"                   # 영어 원문
-ORIGINAL_MD_COL = "content_markdown"
+ORIGINAL_MD_COL = "content_markdown"           # 영어 마크다운
 TRANSLATION_TEXT_COL = "content_translated"    # 한국어 번역
-TRANSLATION_MD_COL = "content_markdown_translated"
+TRANSLATION_MD_COL = "content_markdown_translated"  # 한국어 마크다운
 
 SUSPICION_SCORE_COL = "SCORE"
-CONTENT_TYPO_REPORT_COL = "CONTENT_TYPO_REPORT"      # 영어 검수 결과
-TRANSLATED_COL = "TRANSLATED_TYPO_REPORT"            # 한국어 검수 결과
-MARKDOWN_REPORT_COL = "MARKDOWN_REPORT"              # 마크다운 관련 오류
+CONTENT_TYPO_REPORT_COL = "CONTENT_TYPO_REPORT"      # 영어 검수 결과 (plain)
+TRANSLATED_COL = "TRANSLATED_TYPO_REPORT"            # 한국어 검수 결과 (plain)
+MARKDOWN_REPORT_COL = "MARKDOWN_REPORT"              # 마크다운 관련 오류 (en/ko 통합)
 
 
 # ---------------------------------------------------
-# 3. 공통 유틸: 리포트 후처리 / 문장부호 강제 / hallucination 필터
+# 3. 공통 유틸: 문자/언어 판별
+# ---------------------------------------------------
+
+def contains_hangul(text: str) -> bool:
+    return any('가' <= ch <= '힣' for ch in text)
+
+
+def contains_latin(text: str) -> bool:
+    return any(('a' <= ch <= 'z') or ('A' <= ch <= 'Z') for ch in text)
+
+
+# ---------------------------------------------------
+# 4. 공통 유틸: 리포트 후처리 / 문장부호 강제 / hallucination 필터
 # ---------------------------------------------------
 
 def dedup_korean_bullet_lines(report: str) -> str:
@@ -114,89 +126,8 @@ def dedup_korean_bullet_lines(report: str) -> str:
             elif o2 in o1 and len(o2) < len(o1):
                 to_drop.add(e2["idx"])
 
-    final_lines = [
-        l for idx, l in enumerate(unique_lines) if idx not in to_drop
-    ]
-
+    final_lines = [l for idx, l in enumerate(unique_lines) if idx not in to_drop]
     return "\n".join(final_lines)
-
-
-# 종결부호 뒤 공백은 정상 → 보고서에서 제거
-def drop_false_punctuation_space_errors(text: str, report: str) -> str:
-    """
-    '- ...: Spacing error' 류 중에서
-    '문장부호(.?! 등) + 공백 + 새 문장 시작' 형태는 정상으로 보고 제거.
-    """
-    if not report:
-        return report
-
-    fixed = []
-    for line in report.splitlines():
-        if "Spacing error" in line or "공백 오류" in line:
-            # 원문 추출
-            m = re.search(r"'(.+?)' →", line)
-            if m:
-                original = m.group(1)
-                # 종결부호 뒤 공백 여부 검사
-                if re.search(r"[.!?]\s+[가-힣A-Za-z]", original):
-                    # 이건 정상 구조 → 버린다
-                    continue
-        fixed.append(line)
-    return "\n".join(fixed)
-
-
-def drop_false_korean_period_errors(report: str) -> str:
-    """
-    한국어 리포트에서, '원문' 부분에 이미 종결부호가 있는데
-    '마침표가 없습니다' 류로 잘못 보고한 줄을 제거한다.
-    """
-    if not report:
-        return ""
-
-    cleaned_lines = []
-    pattern = re.compile(r"^- '(.+?)' → '(.+?)':", re.UNICODE)
-    bad_phrases = [
-        "마침표가 없습니다",
-        "마침표가 빠져",
-        "마침표가 필요",
-        "마침표를 찍어야",
-        "문장 끝에 마침표가 없",
-    ]
-
-    for line in report.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-
-        # 마침표 관련 멘트가 아니면 그대로 통과
-        if not any(p in s for p in bad_phrases):
-            cleaned_lines.append(s)
-            continue
-
-        m = pattern.match(s)
-        if not m:
-            cleaned_lines.append(s)
-            continue
-
-        original = m.group(1).rstrip()
-        if not original:
-            cleaned_lines.append(s)
-            continue
-
-        last = original[-1]
-        ok = False
-        if last in ".?!":
-            ok = True
-        elif len(original) >= 2 and last in ['"', "'", "”", "’", "」", "』", "》", "〉", ")", "]"] and original[-2] in ".?!":
-            ok = True
-
-        # 이미 종결부호가 있으면 → 이 줄은 가짜 오류로 보고 제거
-        if ok:
-            continue
-        else:
-            cleaned_lines.append(s)
-
-    return "\n".join(cleaned_lines)
 
 
 def drop_lines_not_in_source(source_text: str, report: str) -> str:
@@ -204,17 +135,16 @@ def drop_lines_not_in_source(source_text: str, report: str) -> str:
     report 안 '- '원문' → '수정안':' 패턴에서 '원문'이
     1) 실제 source_text에 완전 동일하게 존재하는 경우만 유지
     2) 띄어쓰기 normalize 후에도 존재하지 않으면 제거
-    3) 부분 문자열만 일치할 경우도 제거
     """
     if not report:
         return ""
 
-    cleaned = []
+    cleaned: List[str] = []
     pattern = re.compile(r"^- '(.+?)' → '(.+?)':", re.UNICODE)
 
-    # normalize
     normalized_src = (
-        source_text.replace(" ", "")
+        (source_text or "")
+        .replace(" ", "")
         .replace("\n", "")
         .replace("\u200b", "")
         .strip()
@@ -232,8 +162,8 @@ def drop_lines_not_in_source(source_text: str, report: str) -> str:
 
         original = m.group(1)
 
-        # 완전 동일 매칭만 허용
-        if original in source_text:
+        # 완전 동일 매칭 허용
+        if original in (source_text or ""):
             cleaned.append(s)
             continue
 
@@ -248,31 +178,33 @@ def drop_lines_not_in_source(source_text: str, report: str) -> str:
     return "\n".join(cleaned)
 
 
-def drop_escape_false_positives(report: str) -> str:
+def drop_escape_false(report: str) -> str:
     """
-    \"\\\"\", \"\\'\", '\"/\"' 등 escape/포맷팅 전용 토큰 때문에
-    발생하는 잘못된 따옴표/문장부호 오류를 제거.
+    JSON / Markdown escape로 인한 오탐 제거
     """
     if not report:
-        return report
+        return ""
 
     false_patterns = [
         r'\\\"',   # \"
-        r'\\\'',   # \'
+        r"\\\'",   # \'
         r'\"/\"',
-        r'\"',
-        r'/\"',
         r'\"/',
+        r'/\"',
+        r'\\`',
     ]
 
-    cleaned = []
+    cleaned: List[str] = []
     for line in report.splitlines():
-        for p in false_patterns:
-            if re.search(p, line):
-                # escape 문자열로 인한 오판 → 제거
-                break
-        else:
-            cleaned.append(line)
+        s = line.strip()
+        if not s:
+            continue
+
+        if any(re.search(p, s) for p in false_patterns):
+            # escape 문자열로 인한 오판 → 제거
+            continue
+
+        cleaned.append(s)
 
     return "\n".join(cleaned)
 
@@ -280,7 +212,7 @@ def drop_escape_false_positives(report: str) -> str:
 def ensure_final_punctuation_error(text: str, report: str) -> str:
     """
     문단 마지막 문장의 끝에 종결부호(. ? !)가 없으면
-    report에 해당 오류를 강제로 한 줄 추가한다. (한국어 쪽에서 주로 사용)
+    report에 해당 오류를 강제로 한 줄 추가한다. (주로 한국어용)
     """
     if not text or not text.strip():
         return report or ""
@@ -294,7 +226,11 @@ def ensure_final_punctuation_error(text: str, report: str) -> str:
     end_ok = False
     if last in ".?!":
         end_ok = True
-    elif last in ['"', "'", "”", "’", "」", "』", "》", "〉", ")", "]"] and len(s) >= 2 and s[-2] in ".?!":
+    elif (
+        len(s) >= 2
+        and last in ['"', "'", "”", "’", "」", "』", "》", "〉", ")", "]"]
+        and s[-2] in ".?!"
+    ):
         end_ok = True
 
     if end_ok:
@@ -313,27 +249,28 @@ def ensure_final_punctuation_error(text: str, report: str) -> str:
 
 def ensure_sentence_end_punctuation(text: str, report: str) -> str:
     """
-    문장 단위로 잘라서 종결부호(. ? !) 없는 문장이 있으면
-    한 줄로 요약해서 보고.
+    문단 안의 문장들 중 종결부호 없는 문장이 있으면 한 줄 요약 오류를 추가.
+    (한국어/영어 공통)
     """
     if not text or not text.strip():
         return report or ""
 
-    # 기본 문장 분리
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-
     missing = []
-    for i, s in enumerate(sentences):
+
+    for s in sentences:
         s = s.strip()
         if not s:
             continue
 
         ok = (
             s[-1] in ".?!"
-            or (len(s) >= 2 and s[-1] in ['"', "'", "”", "’", "」", "』", "》", "〉", ")", "]"] and s[-2] in ".?!")
+            or (
+                len(s) >= 2
+                and s[-1] in ['"', "'", "”", "’", "」", "』", "》", "〉", ")", "]"]
+                and s[-2] in ".?!"
+            )
         )
-
-        # 종결부호 없는 문장 수집
         if not ok:
             missing.append(s)
 
@@ -341,7 +278,6 @@ def ensure_sentence_end_punctuation(text: str, report: str) -> str:
         return report or ""
 
     line = "- 문장 끝에 종결부호(., ?, !)가 누락된 문장이 있습니다."
-
     if report:
         return report.rstrip() + "\n" + line
     else:
@@ -357,7 +293,7 @@ def clean_self_equal_corrections(report: str) -> str:
     if not report:
         return ""
 
-    cleaned_lines = []
+    cleaned_lines: List[str] = []
     pattern = re.compile(r"^- '(.+?)' → '(.+?)':", re.UNICODE)
 
     for line in report.splitlines():
@@ -374,7 +310,6 @@ def clean_self_equal_corrections(report: str) -> str:
         fixed = m.group(2).strip()
 
         if orig == fixed:
-            # '원문' == '수정안'인 라인은 의미 없으므로 제거
             continue
 
         cleaned_lines.append(line_stripped)
@@ -386,7 +321,7 @@ def drop_false_period_errors(english_text: str, report: str) -> str:
     """
     영어 원문 끝에 실제로 . ? ! 이 있으면
     리포트에서 '마침표 없음'류 문장을 제거.
-    (거짓 양성 줄이기용)
+    (거짓 양성 줄이기용) — 주로 단일 문장용
     """
     if not report:
         return ""
@@ -400,6 +335,7 @@ def drop_false_period_errors(english_text: str, report: str) -> str:
             "마침표가 빠져",
             "마침표가 필요",
             "마침표를 찍어야",
+            "Missing end-of-sentence punctuation",
         ]
         cleaned_lines = []
         for line in report.splitlines():
@@ -453,85 +389,227 @@ def split_report_by_source(report: str, plain_text: str, md_text: str) -> tuple[
 
 
 # ---------------------------------------------------
-# 3-A. 한국어 단어 내부 분리(형태소 분리) 후처리 전용 유틸
+# 4-1. 추가 필터: self equal 제거 (공통)
 # ---------------------------------------------------
 
-# ✅ 단어 내부 분리 오류 예외(정상 표현) 화이트리스트
-INTERNAL_SPLIT_WHITELIST: set[str] = {
-    "할 수",
-    "수 있",
-    "할 것",
-    "것 이",
-    "있 을",
-    "할 뿐",
-    "중요 한",
-    "같 은 점",
-    "다른 점",
-    # 필요할 때 점점 추가해서 사용
-}
-
-
-def find_korean_internal_split_candidates(text: str) -> list[tuple[str, str]]:
+def remove_self_equal(report: str) -> str:
     """
-    '된 다', '묻 는' 같은 **단어 내부 분리**만 후보로 잡는다.
-    - 앞/뒤 각각 1~2글자짜리 한글 + 공백 + 1~2글자짜리 한글
-    - INTERNAL_SPLIT_WHITELIST에 있는 정상 표현은 제외
+    모든 리포트에 공통 적용하는 self equal 제거
     """
-    if not text:
-        return []
-
-    candidates: list[tuple[str, str]] = []
-
-    # ([가-힣]{1,2}) + 공백 + ([가-힣]{1,2}) 패턴만 잡음
-    pattern = re.compile(r"([가-힣]{1,2})\s+([가-힣]{1,2})")
-
-    for m in pattern.finditer(text):
-        left = m.group(1)
-        right = m.group(2)
-        span_text = f"{left} {right}"
-
-        # 1) whitelist에 있으면 정상 띄어쓰기 → 건너뛰기
-        if span_text in INTERNAL_SPLIT_WHITELIST:
-            continue
-
-        fixed = left + right
-        candidates.append((span_text, fixed))
-
-    return candidates
-
-
-def build_internal_split_report(text: str) -> str:
-    """
-    find_korean_internal_split_candidates() 결과를
-    리포트 형식의 문자열로 변환한다.
-    """
-    errors = find_korean_internal_split_candidates(text)
-    if not errors:
+    if not report:
         return ""
 
-    lines: list[str] = []
-    for orig, fixed in errors:
-        lines.append(
-            f"- '{orig}' → '{fixed}': '{orig}'는 단어 내부 공백이 잘못 들어간 형태소 분리 오류이며 "
-            f"'{fixed}'로 붙여 써야 합니다."
-        )
-    return "\n".join(lines)
+    cleaned: List[str] = []
+    pattern = re.compile(r"^- '(.+?)' → '(.+?)':")
+
+    for line in report.splitlines():
+        m = pattern.match(line.strip())
+        if m:
+            orig = m.group(1).strip()
+            fixed = m.group(2).strip()
+            if orig == fixed:
+                continue
+        cleaned.append(line.strip())
+
+    return "\n".join(cleaned)
+
+
+def drop_language_switch(report: str) -> str:
+    """
+    한국어 원문 → 영어 수정안 / 영어 원문 → 한국어 수정안
+    등 언어 자체가 바뀌면 무조건 hallucination으로 제거.
+    """
+    if not report:
+        return ""
+
+    cleaned: List[str] = []
+    pattern = re.compile(r"^- '(.+?)' → '(.+?)':")
+
+    for line in report.splitlines():
+        s = line.strip()
+        m = pattern.match(s)
+
+        if not m:
+            cleaned.append(s)
+            continue
+
+        orig, fix = m.group(1), m.group(2)
+
+        hangul_o = contains_hangul(orig)
+        hangul_f = contains_hangul(fix)
+        latin_o = contains_latin(orig)
+        latin_f = contains_latin(fix)
+
+        # 한국어 → 영어 / 영어 → 한국어 → 무조건 삭제
+        if hangul_o and latin_f:
+            continue
+        if latin_o and hangul_f:
+            continue
+
+        cleaned.append(s)
+
+    return "\n".join(cleaned)
+
+
+def drop_large_edits(report: str) -> str:
+    """
+    수정안이 원문보다 4글자 이상 더 길거나 짧으면
+    '의미 변경' 가능성이 높으므로 drop.
+    (공백 제거 후 길이 기준)
+    """
+    if not report:
+        return ""
+
+    cleaned: List[str] = []
+    pattern = re.compile(r"^- '(.+?)' → '(.+?)':")
+
+    for line in report.splitlines():
+        s = line.strip()
+        m = pattern.match(s)
+
+        if not m:
+            cleaned.append(s)
+            continue
+
+        orig = m.group(1).replace(" ", "")
+        fix = m.group(2).replace(" ", "")
+
+        if abs(len(fix) - len(orig)) >= 4:
+            continue
+
+        cleaned.append(s)
+
+    return "\n".join(cleaned)
+
+
+def drop_false_period_claims(text: str, report: str) -> str:
+    """
+    실제로 원문 조각 끝에 종결부호가 있는데
+    '마침표 없음' / 'Missing end-of-sentence punctuation'이라고 한 줄 제거.
+    (영/한 공통)
+    """
+    if not report:
+        return ""
+
+    cleaned: List[str] = []
+    pattern = re.compile(r"^- '(.+?)' → '(.+?)':")
+
+    false_keywords = [
+        "Missing end-of-sentence punctuation",
+        "sentence-ending punctuation",
+        "마침표가 없습니다",
+        "마침표가 필요",
+        "마침표가 빠져",
+        "문장 끝에 마침표가 없",
+    ]
+
+    for line in report.splitlines():
+        s = line.strip()
+
+        if not any(k in s for k in false_keywords):
+            cleaned.append(s)
+            continue
+
+        m = pattern.match(s)
+        if not m:
+            cleaned.append(s)
+            continue
+
+        orig = m.group(1).rstrip()
+
+        if not orig:
+            cleaned.append(s)
+            continue
+
+        # 원문 끝이 종결부호면 → 이 줄은 오탐
+        if orig.endswith(('.', '?', '!')):
+            continue
+        if (
+            len(orig) >= 2
+            and orig[-1] in ['"', "'", "”", "’", "」", "』", "]"]
+            and orig[-2] in ".?!"
+        ):
+            continue
+
+        cleaned.append(s)
+
+    return "\n".join(cleaned)
+
+
+def drop_punctuation_space_style(report: str) -> str:
+    """
+    '문장부호 뒤 공백' 같은 스타일 지적 전부 제거
+    """
+    if not report:
+        return ""
+
+    keywords = [
+        "Missing space after",
+        "space after punctuation",
+        "space after the punctuation",
+        "공백이 필요",
+        "공백을 추가해야",
+        "space after the sentence-ending punctuation mark",
+    ]
+
+    cleaned: List[str] = []
+    for line in report.splitlines():
+        if any(k in line for k in keywords):
+            continue
+        cleaned.append(line.strip())
+
+    return "\n".join(cleaned)
+
+
+def sanitize_report(original_text: str, report: str) -> str:
+    """
+    모든 후처리 필터를 순차 적용.
+    (언어 스위치/대규모 수정/escape/마침표 오탐/공백 스타일/텍스트 불일치 등)
+    """
+    if not report:
+        return ""
+
+    r = report
+
+    # 1) self equal 제거
+    r = remove_self_equal(r)
+
+    # 2) escape 기반 오탐 제거
+    r = drop_escape_false(r)
+
+    # 3) 언어 스위치 제거
+    r = drop_language_switch(r)
+
+    # 4) 큰 폭 수정 제거
+    r = drop_large_edits(r)
+
+    # 5) 마침표 존재하는데 '없다'고 주장 → 제거
+    r = drop_false_period_claims(original_text, r)
+
+    # 6) 마침표/쉼표 뒤 공백 스타일 지적 제거
+    r = drop_punctuation_space_style(r)
+
+    # 7) 원문에 없는 조각 제거 (띄어쓰기 normalize 기반)
+    r = drop_lines_not_in_source(original_text, r)
+
+    return r.strip()
 
 
 # ---------------------------------------------------
-# 3. 프롬프트 정의 (영어 / 한국어 분리)
+# 5. 프롬프트 정의 (영어 / 한국어 분리)
 # ---------------------------------------------------
 
 def create_english_review_prompt(text: str) -> str:
     """
-    시트의 content(영어 원문)에 대해 검수하는 프롬프트.
+    시트의 content(영어 원문 + 마크다운)에 대해 검수하는 프롬프트.
     - 스펠링 / split-word / AI↔Al / 대문자 / 기본 문장 부호
     - 결과는 content_typo_report(한국어 설명)에만 쌓이게 유도
     """
     return f"""
 You are a machine-like **English text proofreader**.
 Your ONLY job is to detect **objective, verifiable errors** in the following English text.
-You MUST NOT suggest stylistic changes, paraphrasing, natural-sounding alternatives, tone changes, or meaning changes.
+You MUST NOT suggest stylistic changes, paraphrasing, natural-sounding alternatives,
+tone changes, or meaning changes.
 
 Your response MUST be a single valid JSON object with keys:
 - "suspicion_score": integer 1~5
@@ -563,45 +641,15 @@ If an English word appears with an incorrect internal space,
 AND removing the space yields a valid English word,
 you MUST treat it as a spelling error.
 
-ALWAYS flag patterns like:
-- "wi th"  → "with"
-- "dea th" → "death"
-- "o f"    → "of"
-- "amo ng" → "among"
-- "cont inents" → "continents"
-
-Report format (Korean):
-"- 'wi th' → 'with': 'wi th'는 단어 내부 공백이 잘못된 오타이며 'with'로 수정해야 합니다."
-
 ## (B) Normal English spelling mistakes (MUST detect)
 Any token similar to a valid English word (1–2 letters swapped/missing) MUST be flagged.
-
-Examples (patterns, not exhaustive):
-1. recieve → receive
-2. enviroment → environment
-3. understaning → understanding
-4. langauge → language
-5. problme → problem
-6. definately → definitely
-7. seperated → separated
-8. occured → occurred
-9. adress → address
-10. wierd → weird
-11. becuase → because
-12. comming → coming
-13. teh → the
 
 ## (C) AI 문맥에서 "Al" → "AI" (항상 잡기)
 If the surrounding sentence mentions:
 model / system / tool / chatbot / LLM / agent / dataset / training / inference
 then “Al” (A+소문자 l) MUST be interpreted as a typo for “AI”.
 
-Examples:
-- "Al model" → "AI model"
-- "Al system" → "AI system"
-
 ## (D) Capitalization Errors
-You MUST flag:
 - Sentence starting with lowercase
 - Pronoun “I” written as “i”
 - Proper nouns not capitalized (london → London)
@@ -614,8 +662,8 @@ You MUST flag:
 ## (F) STRICT punctuation rule — avoid false positives
 You MUST NOT report a punctuation error if the text already ends with ANY of:
 - ".", "?", "!"
-- ".*\"", ".*!\"", ".*?\""
-- ".*’", ".*!’", ".*?’"
+- '."' / '!"' / '?"'
+- ".’" / "!’" / "?’"
 
 ONLY report a punctuation error if:
 - the sentence has NO ending punctuation at all, OR
@@ -645,13 +693,23 @@ plain_english: \"\"\"{text}\"\"\"
 
 def create_korean_review_prompt(text: str) -> str:
     """
-    시트의 content_translated(한국어 번역)에 대해 검수하는 프롬프트.
+    시트의 content_translated(한국어 번역 + 마크다운)에 대해 검수하는 프롬프트.
     - 오탈자 / 조사·어미 / 띄어쓰기 / 형태소 분리 / 반복 / 문장부호
     - 결과는 translated_typo_report에만 쌓이게 유도
     """
     return f"""
 당신은 기계적으로 동작하는 **Korean text proofreader**입니다.
 당신의 유일한 임무는 아래 한국어 텍스트에서 **객관적이고 확인 가능한 오류만** 찾아내는 것입니다.
+스타일, 어투, 자연스러움, 표현 개선, 의도 추론과 같은 주관적 판단은 절대 해서는 안 됩니다.
+
+출력은 반드시 아래 4개의 key만 포함하는 **단일 JSON 객체**여야 합니다.
+- "suspicion_score": 1~5 정수
+- "content_typo_report": ""       ← 항상 빈 문자열 (영어용 필드)
+- "translated_typo_report": 한국어 오류 설명 (없으면 "")
+- "markdown_report": ""           ← 항상 빈 문자열
+
+모든 설명은 반드시 **한국어로** 작성해야 합니다.
+오류가 하나도 없으면 모든 report 필드는 "" 여야 합니다.
 
 ============================================================
 🚨 가장 중요한 규칙 (원문 보존 — 절대 위반 금지)
@@ -659,18 +717,19 @@ def create_korean_review_prompt(text: str) -> str:
 아래 질문 중 하나라도 “예”라면, 그 수정은 **보고하지 말고 완전히 무시**해야 합니다.
 
 1) 수정하려는 부분이 plain_korean에 **그대로 존재하지 않는가?**
-2) 단어 **순서를 변경**해야 하는가?
-3) 의미가 달라질 수 있는 수정인가?
-4) 새로운 단어를 **추가해야만** 수정이 가능한가?
-5) 자연스럽게 들리도록 **다듬는 것**처럼 보이는가?
-6) 문장을 사실상 **다시 쓰는 것처럼** 보이는가?
+2) 수정하려면 **5글자 이상** 바꿔야 하는가?
+3) 단어 **순서를 변경**해야 하는가?
+4) 의미가 달라질 수 있는 수정인가?
+5) 새로운 단어를 **추가해야만** 수정이 가능한가?
+6) 자연스럽게 들리도록 **다듬는 것**처럼 보이는가?
+7) 문장을 사실상 **다시 쓰는 것처럼** 보이는가?
 
 → 하나라도 “예”라면, 해당 오류는 **절대 출력하지 않는다.**
 
 ============================================================
 🚫 Hallucination 방지 규칙
 ============================================================
-❌ 존재하지 않는 단어/구절 생성 금지  
+❌ 입력 텍스트에 존재하지 않는 단어·구절 생성 금지  
 ❌ 프롬프트 설명부에 있는 단어를 ‘원문’으로 재사용 금지  
 ❌ 원문의 문장 구조·의도·톤·어순 변경 금지  
 
@@ -678,23 +737,8 @@ def create_korean_review_prompt(text: str) -> str:
 반드시 plain_korean 안에 **문자 단위로 동일하게 존재**해야 합니다.
 
 ============================================================
-📌 안전 예시 (더미 토큰 — 출력 금지)
-============================================================
-아래 예시는 허용되는 “수정 크기의 범위”만 설명하기 위한 것이며  
-AAA/BBB/CCC 등은 실제 텍스트에 없는 **더미 토큰**입니다.  
-출력에 등장하면 안 됩니다.
-
-- 'AAA를를' → 'AAA를' : 조사 중복 수정(1~2글자)
-- 'BBB 을' → 'BBB을' : 공백/조사 오용(극소수 변경)
-- 'CCC 한 다' → 'CCC한다' : 단어 내부 공백(형태소 분리 오류)
-- 'DDD다다다' → 'DDD다' : 반복 오타 정리
-
-※ 위 예시는 단순 설명용이며 실제 출력에 포함되면 안 됩니다.
-
-============================================================
 # 1. 한국어에서 반드시 잡아야 하는 객관적 오류
 ============================================================
-
 (A) 오탈자 / 철자 오류  
 (B) 조사·어미 오류  
 (C) 단어 내부 불필요한 공백  
@@ -709,29 +753,12 @@ AAA/BBB/CCC 등은 실제 텍스트에 없는 **더미 토큰**입니다.
 [G] 문장부호 뒤 공백 규칙 (중요)
 - 문장 끝에 마침표/물음표/느낌표가 있고, 그 뒤에서 새로운 문장이 시작될 경우,
   문장부호 뒤의 공백은 **정상이며 오타가 아니다.**
-- 그러므로 "흘린다. 텔레비전"처럼 
-  종결부호 + 공백 + 새로운 문장이 시작되는 구조는 절대로 오류로 판단하지 않는다.
-- 단어 내부에서 불필요한 공백(예: '흘 린다', '한다 다')만 오류로 인정한다.
-
-다음과 같은 패턴은 문법적 오류가 아니므로 절대로 오류로 보고하지 않는다.
-- \"  ← JSON/markdown에서 쓰는 escape 문자
-- \'  
-- \"\"  
-- /"  
-- "/  
-- */"  
-- '"'
-- markdown code block 기술에서 사용되는 `\"`, `\'`, `\(` 등
-
-이들은 단순한 escape 또는 마크다운 포맷팅일 뿐이며,
-따옴표 짝 불일치나 문장부호 오류로 간주해서는 안 된다.
-
-특히 plain_korean 전체의 **마지막 문장 끝에 종결부호가 없으면 반드시 오류로 보고해야 합니다.**
+- 단어 내부에서 불필요한 공백(예: '흘 린다', '된 다')만 오류로 인정한다.
 
 ============================================================
-# 2. Output Format (JSON Only)
+# 2. OUTPUT FORMAT (JSON Only)
 ============================================================
-다음 형식으로 bullet 단위 오류를 출력해야 합니다:
+오류가 있을 경우 한 줄씩 bullet:
 
 "- '원문' → '수정안': 오류 설명"
 
@@ -744,12 +771,12 @@ AAA/BBB/CCC 등은 실제 텍스트에 없는 **더미 토큰**입니다.
 ============================================================
 # 3. TEXT TO REVIEW
 ============================================================
-plain_korean: "/"/"{text}"/"/"
+plain_korean: \"\"\"{text}\"\"\"
 """
 
 
 # ---------------------------------------------------
-# 3-1. 공통: Gemini 호출 / 결과 정제
+# 6. Gemini 호출 / 기본 정제
 # ---------------------------------------------------
 
 def analyze_text_with_gemini(prompt: str, max_retries: int = 5) -> dict:
@@ -843,8 +870,10 @@ def validate_and_clean_analysis(result: dict) -> dict:
         if any(ph in text for ph in forbidden_phrases):
             reports[key] = ""
 
-    # 영어 리포트에 대해서 self equal 정리 (시트 영어 쪽에서 사용)
-    reports["content_typo_report"] = clean_self_equal_corrections(reports["content_typo_report"])
+    # 영어 리포트에 대해서 self equal 정리
+    reports["content_typo_report"] = clean_self_equal_corrections(
+        reports["content_typo_report"]
+    )
 
     # score 기본값 보정
     try:
@@ -857,9 +886,16 @@ def validate_and_clean_analysis(result: dict) -> dict:
     if score > 5:
         score = 5
 
-    if not reports["content_typo_report"] and not reports["translated_typo_report"] and not reports["markdown_report"]:
+    if (
+        not reports["content_typo_report"]
+        and not reports["translated_typo_report"]
+        and not reports["markdown_report"]
+    ):
         score = 1
-    elif (reports["content_typo_report"] or reports["translated_typo_report"] or reports["markdown_report"]) and score == 1:
+    elif (
+        (reports["content_typo_report"] or reports["translated_typo_report"] or reports["markdown_report"])
+        and score == 1
+    ):
         score = 3
 
     return {
@@ -871,7 +907,7 @@ def validate_and_clean_analysis(result: dict) -> dict:
 
 
 # ---------------------------------------------------
-# 3-2. 한 행(영어+한국어)을 통합 검수하는 헬퍼
+# 7. 한 행(영어+한국어)을 통합 검수하는 헬퍼
 # ---------------------------------------------------
 
 def analyze_row_with_both_langs(row: Dict[str, Any]):
@@ -901,11 +937,11 @@ def analyze_row_with_both_langs(row: Dict[str, Any]):
         raw_en = analyze_text_with_gemini(prompt_en)
         final_en = validate_and_clean_analysis(raw_en)
 
-        filtered_en = drop_lines_not_in_source(
-            en_text,  # ✅ 통합 텍스트 기준으로 존재 여부 확인
+        filtered_en = sanitize_report(
+            en_text,
             final_en.get("content_typo_report", "") or "",
         )
-        filtered_en = drop_false_period_errors(en_text, filtered_en)
+        # 영어 쪽도 문장 끝 종결부호 누락을 한 줄 요약으로 catch
         filtered_en = ensure_sentence_end_punctuation(en_text, filtered_en)
         final_en["content_typo_report"] = filtered_en
     else:
@@ -922,25 +958,13 @@ def analyze_row_with_both_langs(row: Dict[str, Any]):
         raw_ko = analyze_text_with_gemini(prompt_ko)
         final_ko = validate_and_clean_analysis(raw_ko)
 
-        filtered_ko = drop_lines_not_in_source(
-            ko_text,  # ✅ 통합 텍스트 기준
+        filtered_ko = sanitize_report(
+            ko_text,
             final_ko.get("translated_typo_report", "") or "",
         )
-        filtered_ko = drop_false_korean_period_errors(filtered_ko)
         filtered_ko = ensure_final_punctuation_error(ko_text, filtered_ko)
         filtered_ko = ensure_sentence_end_punctuation(ko_text, filtered_ko)
-        filtered_ko = drop_escape_false_positives(filtered_ko)
         filtered_ko = dedup_korean_bullet_lines(filtered_ko)
-
-        # 🔹 추가: 단어 내부 분리(형태소 분리) 전용 규칙 리포트 덧붙이기
-        internal_report = build_internal_split_report(ko_text)
-        if internal_report:
-            if filtered_ko:
-                filtered_ko = filtered_ko.rstrip() + "\n" + internal_report
-            else:
-                filtered_ko = internal_report
-
-        filtered_ko = drop_false_punctuation_space_errors(ko_text, filtered_ko)
         final_ko["translated_typo_report"] = filtered_ko
     else:
         final_ko = {
@@ -1006,7 +1030,7 @@ def analyze_row_with_both_langs(row: Dict[str, Any]):
 
 
 # ---------------------------------------------------
-# 4. 공개 함수: 시트 전체를 돌리고 요약 리턴
+# 8. 공개 함수: 시트 전체를 돌리고 요약 리턴
 # ---------------------------------------------------
 
 def run_sheet_review(
@@ -1104,17 +1128,27 @@ def run_sheet_review(
     markdown_col_idx = headers.index(MARKDOWN_REPORT_COL) + 1
     status_col_idx = headers.index(STATUS_COL) + 1
 
-    def sanitize(v):
+    def sanitize_cell(v):
         return "" if v is None else str(v)
 
-    update_cells = []
+    update_cells: List[gspread.Cell] = []
     for r in results:
         ridx = r["sheet_row_index"]
-        update_cells.append(gspread.Cell(ridx, score_col_idx, sanitize(r[SUSPICION_SCORE_COL])))
-        update_cells.append(gspread.Cell(ridx, content_col_idx, sanitize(r[CONTENT_TYPO_REPORT_COL])))
-        update_cells.append(gspread.Cell(ridx, translated_col_idx, sanitize(r[TRANSLATED_COL])))
-        update_cells.append(gspread.Cell(ridx, markdown_col_idx, sanitize(r[MARKDOWN_REPORT_COL])))
-        update_cells.append(gspread.Cell(ridx, status_col_idx, sanitize(r[STATUS_COL])))
+        update_cells.append(
+            gspread.Cell(ridx, score_col_idx, sanitize_cell(r[SUSPICION_SCORE_COL]))
+        )
+        update_cells.append(
+            gspread.Cell(ridx, content_col_idx, sanitize_cell(r[CONTENT_TYPO_REPORT_COL]))
+        )
+        update_cells.append(
+            gspread.Cell(ridx, translated_col_idx, sanitize_cell(r[TRANSLATED_COL]))
+        )
+        update_cells.append(
+            gspread.Cell(ridx, markdown_col_idx, sanitize_cell(r[MARKDOWN_REPORT_COL]))
+        )
+        update_cells.append(
+            gspread.Cell(ridx, status_col_idx, sanitize_cell(r[STATUS_COL]))
+        )
 
     if update_cells:
         worksheet.update_cells(update_cells)
