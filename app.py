@@ -228,10 +228,6 @@ def drop_false_korean_period_errors(report: str) -> str:
 
 
 def ensure_final_punctuation_error(text: str, report: str) -> str:
-    """
-    문단 마지막 문장의 끝에 종결부호(. ? !)가 없으면
-    report에 오류를 강제로 한 줄 추가한다.
-    """
     if not text or not text.strip():
         return report or ""
 
@@ -240,6 +236,7 @@ def ensure_final_punctuation_error(text: str, report: str) -> str:
         return report or ""
 
     last = s[-1]
+
     end_ok = False
     if last in ".?!":
         end_ok = True
@@ -249,16 +246,57 @@ def ensure_final_punctuation_error(text: str, report: str) -> str:
     if end_ok:
         return report or ""
 
-    # 이미 비슷한 멘트가 있으면 중복 추가 안 함
-    if report and ("마지막 문장에 마침표" in report or "문장 끝에 마침표가 없" in report):
+    # 이미 비슷한 내용이 있으면 중복으로 추가하지 않음
+    if report and ("마침표" in report or "문장부호" in report):
         return report
 
-    line = "- '수 있었다' → '수 있었다.': 마지막 문장에 마침표가 없습니다."
-    # 위 예시는 실제 원문 기준으로 나가지는 않지만, 요약형 한 줄로 사용
+    # 🔴 여기에서 '수 있었다' 같은 예시를 쓰지 말고,
+    #     그냥 설명만 추가한다.
+    line = "- 문단 마지막 문장 끝에 마침표(또는 물음표, 느낌표)가 빠져 있으므로 적절한 문장부호를 추가해야 합니다."
+
     if report:
         return report.rstrip() + "\n" + line
     else:
         return line
+
+
+
+def ensure_english_final_punctuation(text: str, report: str) -> str:
+    """
+    영어 텍스트의 '마지막 문장'이 ., ?, ! 로 끝나지 않으면
+    아주 보수적인 요약 경고 한 줄을 추가한다.
+    (쉼표/세미콜론/콜론 등으로 끝나는 경우 포함)
+    """
+    if not text or not text.strip():
+        return report or ""
+
+    s = text.rstrip()
+    if not s:
+        return report or ""
+
+    last = s[-1]
+
+    end_ok = False
+    if last in ".?!":
+        end_ok = True
+    # 따옴표/괄호 뒤에 .?! 가 있는 경우 허용
+    elif last in ['"', "'", ")", "]", "”", "’"] and len(s) >= 2 and s[-2] in ".?!":
+        end_ok = True
+
+    if end_ok:
+        return report or ""
+
+    # 이미 비슷한 문구가 있으면 중복 추가 방지
+    if report and ("종결부호" in report or "마침표" in report or "punctuation" in report):
+        return report
+
+    line = "- 마지막 문장이 종결부호(., ?, !)가 아닌 문장부호로 끝나 있어, 문장을 마침표 등으로 명확히 끝내는 것이 좋습니다."
+
+    if report:
+        return report.rstrip() + "\n" + line
+    else:
+        return line
+
 
 
 def ensure_sentence_end_punctuation(text: str, report: str) -> str:
@@ -497,6 +535,8 @@ def review_korean_text(korean_text: str) -> Dict[str, Any]:
     filtered = ensure_final_punctuation_error(korean_text, filtered)
     filtered = ensure_sentence_end_punctuation(korean_text, filtered)
     filtered = dedup_korean_bullet_lines(filtered)
+    filtered = drop_lines_not_in_source(korean_text, filtered)  # ← 한 번 더 검증
+
 
     return {
         "score": cleaned.get("suspicion_score"),
@@ -961,12 +1001,217 @@ with tab_sheet:
 
 # --- 설명 탭 ---
 with tab_about:
-    st.markdown("""
-## 이 앱은?
 
-- 한국어/영어 **단일 텍스트 검수기** + **Google Sheets 기반 배치 검수기**입니다.
-- 스타일/어투/자연스러움은 건드리지 않고, **오탈자 / 조사 / 띄어쓰기 / 기본 문장부호 / 단순 스펠링 오류**에만 집중합니다.
+    st.title("📘 텍스트 자동 검수기 설명서")
+    st.caption("이 탭은 전체 앱의 구조와 동작 방식을 설명합니다.")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "✨ 앱 소개",
+        "✏️ 한국어 검수",
+        "✏️ 영어 검수",
+        "📄 시트 배치 검수",
+        "🎯 철학 & 규칙"
+    ])
+
+    # -------------------------
+    # 1) 앱 소개 탭
+    # -------------------------
+    with tab1:
+        st.markdown("""
+## ✨ 이 앱은 무엇을 하나요?
+
+이 앱은 **한국어/영어 단일 텍스트 검수기**와  
+**Google Sheets 기반 배치 검수기**를 포함한 **통합 자동 검수 플랫폼**입니다.
+
+- 자연스러움, 문체, 표현 개선 등 **주관적 수정은 전혀 하지 않습니다.**  
+- 오직 **객관적으로 검증 가능한 오류만** 검출합니다.  
+- 모든 검수는 **JSON-only 응답 + 후처리 안정화 로직** 기반으로 작동하여  
+  오탐(False Positive)과 누락을 최소화합니다.
+
+---
 """)
+
+    # -------------------------
+    # 2) 한국어 검수 탭
+    # -------------------------
+    with tab2:
+        st.markdown("""
+# ✏️ 한국어 검수 (Korean Proofreading)
+
+## 🔍 기능 개요
+한국어 텍스트에서 다음과 같은 **형식적·명백한 오류**만 검출합니다:
+
+**검출하는 오류**
+- 오탈자 / 반복 문자  
+- 조사·어미 오류  
+- 명백한 띄어쓰기 오류  
+- 문장부호 오류  
+  - 종결부호 누락  
+  - 따옴표 짝 불일치  
+  - 이상한 쉼표·마침표  
+- (옵션) 단어 내부 분리 오류 (`된 다` → `된다`)
+
+**검출하지 않는 항목**
+- 자연스러운 표현 변경  
+- 의미가 달라질 가능성이 있는 수정  
+- 문장 재작성 수준의 교정  
+- escape/markdown 기반 가짜 오류  
+
+---
+
+## 🧠 작동 방식
+
+1. **한국어 전용 프롬프트 생성**  
+   - "원문 의미 보존" 원칙을 강하게 명시  
+   - 예시 토큰 출력 금지  
+2. **Gemini(JSON mode, temperature=0)** 호출  
+3. **후처리 단계**  
+   - 스타일 제안 제거  
+   - 존재하지 않는 '원문' 기반 수정 제거  
+   - escape 기반 오류 제거  
+   - 종결부호·따옴표 관련 오탐 제거  
+   - plain / markdown 오류 분리  
+4. **최종 출력**  
+   - suspicion_score (1~5)  
+   - translated_typo_report  
+   - raw vs final JSON 비교 가능
+
+---
+""")
+
+    # -------------------------
+    # 3) 영어 검수 탭
+    # -------------------------
+    with tab3:
+        st.markdown("""
+# ✏️ 영어 검수 (English Proofreading)
+
+## 🔍 기능 개요
+영어 텍스트의 **객관적 오류만** 탐지합니다.
+
+**검출하는 오류**
+- 스펠링 오류  
+- split-word 오류 (`wi th`, `o f` 등)  
+- AI 문맥에서 `Al` → `AI` 오표기  
+- 대문자 규칙 위반  
+- 중복 단어  
+- 종결부호 누락  
+
+**검출하지 않는 항목**
+- 스타일·표현 개선  
+- 자연스러운 문장으로의 재작성  
+- 마크다운/escape 기반 오류  
+
+---
+
+## 🧠 작동 방식
+
+1. **영어 전용 프롬프트 생성**
+2. **Gemini(JSON mode)** 호출  
+3. **후처리**  
+   - self-equal 라인 제거  
+   - 원문 미존재 토큰 제거  
+   - 가짜 종결부호 오류 제거  
+   - 스타일 제안 차단  
+4. plain / markdown 오류 분리
+
+**출력 요소**
+- suspicion_score  
+- content_typo_report  
+- raw JSON / final JSON / diff
+
+---
+""")
+
+    # -------------------------
+    # 4) 시트 배치 검수 탭
+    # -------------------------
+    with tab4:
+        st.markdown("""
+# 📄 Google Sheets 기반 배치 검수
+
+## 📘 입력 스키마
+
+| 컬럼명 | 설명 |
+|-------|------|
+| `content` | 영어 plain |
+| `content_markdown` | 영어 markdown |
+| `content_translated` | 한국어 plain |
+| `content_markdown_translated` | 한국어 markdown |
+| `STATUS` | `"1. AI검수요청"` 시 검수 대상 |
+
+---
+
+## 🧠 행 단위 처리 과정
+
+### **1) 영어 검수**
+- plain + markdown 결합  
+- 모델 호출 → 후처리  
+- plain / markdown 오류 분리  
+
+### **2) 한국어 검수**
+- plain + markdown 결합  
+- escape 제거, 종결부호 확인 등 후처리  
+- (옵션) 내부 분리 휴리스틱  
+- plain / markdown 오류 분리  
+
+### **3) 최종 결과 생성**
+- suspicion_score = **max(영어 score, 한국어 score)**  
+- content_typo_report  
+- translated_typo_report  
+- markdown_report  
+- STATUS = `"2. AI검수완료"`
+
+### **4) 시트 업데이트**
+검수 결과가 자동으로 시트 각 행에 기록됩니다.
+
+---
+
+## 🛠 디버그 기능
+
+검수 후 특정 행을 선택하면:
+
+- 영어/한국어 원문  
+- raw JSON  
+- final JSON  
+- plain vs markdown 분석  
+- Raw vs Final Diff  
+
+를 통해 **오류 검출 품질을 세밀하게 확인**할 수 있습니다.
+
+---
+""")
+
+    # -------------------------
+    # 5) 전체 철학 및 규칙 탭
+    # -------------------------
+    with tab5:
+        st.markdown("""
+# 🎯 전체 시스템 철학 및 규칙
+
+## ✔ 의미 보존 원칙
+모든 검수 로직은  
+**“원문의 의미와 의도를 절대 바꾸지 않는다”**  
+를 최우선 원칙으로 합니다.
+
+---
+
+## ✔ Hallucination 방지
+- `'원문'`은 반드시 실제 텍스트에 존재해야 함  
+- JSON-only 응답  
+- 예시 토큰(AAA 등) 출력 금지  
+- 스타일·문체 제안 전부 제거  
+
+---
+
+## ✔ 목표
+- **객관적 오류만 정확하게 검출**  
+- 후처리로 오탐 최소화  
+- plain/markdown을 분리하여 출처를 명확하게 표현  
+
+---
+""")
+
 
 
 # --- 디버그 탭 ---
