@@ -229,18 +229,18 @@ def build_korean_raw_report_for_highlight(raw_json: dict) -> str:
     return (raw_json.get("translated_typo_report") or "").strip()
 
 PUNCT_COLOR_MAP = {
-    ".": "#ffe08a",  # 조금 더 진한 노랑 (종결부호)
-    "?": "#f2a6b3",  # 진한 핑크 (물음표)
-    "!": "#f28b90",  # 진한 빨강 계열 (느낌표)
-    ",": "#9fd3e6",  # 더 진한 하늘 (쉼표)
-    ";": "#bfc2c4",  # 진한 회색 톤 (세미콜론)
-    ":": "#bfc2c4",  # 진한 회색 톤 (콜론)
-    '"': "#b9e6c8",  # 진한 연두 (쌍따옴표)
-    "“": "#b9e6c8",
-    "”": "#b9e6c8",
-    "'": "#f7b58d",  # 진한 살구 (작은따옴표)
-    "‘": "#f7b58d",
-    "’": "#f7b58d",
+    ".": "#fff3cd",  # 연노랑 (종결부호)
+    "?": "#f8d7da",  # 연분홍 (물음표)
+    "!": "#f5c6cb",  # 연한 빨강 (느낌표)
+    ",": "#d1ecf1",  # 연하늘 (쉼표)
+    ";": "#d6d8d9",  # 회색 톤 (세미콜론)
+    ":": "#d6d8d9",  # 회색 톤 (콜론)
+    '"': "#e0f7e9",  # 연연두 (쌍따옴표)
+    "“": "#e0f7e9",
+    "”": "#e0f7e9",
+    "'": "#fce9d9",  # 연살구 (작은따옴표)
+    "‘": "#fce9d9",
+    "’": "#fce9d9",
 }
 
 PUNCT_GROUPS: dict[str, set[str]] = {
@@ -1809,9 +1809,7 @@ with tab_ko:
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f"<div style='background:#f2f4f7; border:1px solid #d0d5dd; border-radius:6px; padding:12px;'>"
-                f"<pre style='white-space: pre-wrap; background:transparent; margin:0; font-weight:600;'>{punctuation_only_ko}</pre>"
-                f"</div>",
+                f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_ko}</pre>",
                 unsafe_allow_html=True,
             )
 
@@ -1973,9 +1971,7 @@ with tab_en:
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f"<div style='background:#f2f4f7; border:1px solid #d0d5dd; border-radius:6px; padding:12px;'>"
-                f"<pre style='white-space: pre-wrap; background:transparent; margin:0; font-weight:600;'>{punctuation_only_en}</pre>"
-                f"</div>",
+                f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_en}</pre>",
                 unsafe_allow_html=True,
             )
 
