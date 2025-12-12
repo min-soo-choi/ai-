@@ -264,7 +264,11 @@ PUNCT_CHARS = set(PUNCT_COLOR_MAP.keys()) | set([
 ])
 
 
-def highlight_text_with_spans(source_text: str, spans: List[Dict[str, Any]]) -> str:
+def highlight_text_with_spans(
+    source_text: str,
+    spans: List[Dict[str, Any]],
+    selected_punct_chars: set[str] | None = None,
+) -> str:
     """
     spans: parse_report_with_positions() 결과.
     - spans에 해당하는 'original' 구간은 <mark>...</mark> 로 감싸서 오류 하이라이트.
@@ -295,10 +299,10 @@ def highlight_text_with_spans(source_text: str, spans: List[Dict[str, Any]]) -> 
     if not intervals:
         result_parts: List[str] = []
         for ch in source_text:
-            if ch in PUNCT_CHARS:
+            if ch in PUNCT_CHARS and (selected_punct_chars is None or ch in selected_punct_chars):
                 color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
                 result_parts.append(
-                    f"<span style='background-color: {color}; padding: 0 1px;'>{html.escape(ch)}</span>"
+                    f"<span style='background-color: {color}; padding: 0 2px; font-weight: 700; font-size: 1.05em; border-radius: 2px;'>{html.escape(ch)}</span>"
                 )
             else:
                 result_parts.append(html.escape(ch))
@@ -334,7 +338,7 @@ def highlight_text_with_spans(source_text: str, spans: List[Dict[str, Any]]) -> 
             # 오류 구간 시작
             in_error = True
             cur_err_end = end
-            result_parts.append("<mark>")
+            result_parts.append("<mark style='background: #fff3a3; padding: 0 2px; font-weight: 700; font-size: 1.05em; border-radius: 2px;'>")
 
         ch = source_text[idx]
 
@@ -351,10 +355,10 @@ def highlight_text_with_spans(source_text: str, spans: List[Dict[str, Any]]) -> 
                 cur_err_end = None
         else:
             # 오류 구간 밖: 문장부호면 색상 하이라이트
-            if ch in PUNCT_CHARS:
+            if ch in PUNCT_CHARS and (selected_punct_chars is None or ch in selected_punct_chars):
                 color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
                 result_parts.append(
-                    f"<span style='background-color: {color}; padding: 0 1px;'>{html.escape(ch)}</span>"
+                    f"<span style='background-color: {color}; padding: 0 2px; font-weight: 700; font-size: 1.05em; border-radius: 2px;'>{html.escape(ch)}</span>"
                 )
             else:
                 result_parts.append(html.escape(ch))
@@ -1751,11 +1755,17 @@ with tab_ko:
 
             spans_ko = parse_korean_report_with_positions(text_ko, report_for_highlight)
 
-            st.markdown(f"#### 🔦 {mode_label} 하이라이트")
+            default_punct_keys = list(PUNCT_GROUPS.keys())
+            selected_punct_keys_ko = st.multiselect(
+                "문장부호 선택",
+                options=default_punct_keys,
+                default=default_punct_keys,
+                key="ko_punct_filter",
+                help="선택한 부호만 색상 표시",
+            )
 
-            if not spans_ko:
-                st.info(f"{mode_label}으로 하이라이트할 항목이 없습니다.")
-            else:
+            st.markdown(f"#### 🔦 {mode_label} 하이라이트")
+            if spans_ko:
                 for span in spans_ko:
                     if span["line"] is None:
                         st.markdown(
@@ -1766,27 +1776,35 @@ with tab_ko:
                             f"- L{span['line']}, C{span['col']} — "
                             f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
                         )
+            else:
+                st.info(f"{mode_label}으로 하이라이트할 항목이 없습니다. 원문을 그대로 표시합니다.")
 
-                highlighted_ko = highlight_text_with_spans(text_ko, spans_ko)
-                st.markdown(
-                    f"<div style='background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px;'>"
-                    f"<pre style='white-space: pre-wrap; background:transparent; margin:0;'>{highlighted_ko}</pre>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-
-            # 문장부호 전용 하이라이트 뷰 (오류 여부와 무관하게 문장부호 색상만 표시)
-            st.markdown("#### ✨ 문장부호만 보기")
-            default_punct_keys = list(PUNCT_GROUPS.keys())
-            selected_punct_keys_ko = st.multiselect(
-                "하이라이트할 문장부호 선택",
-                options=default_punct_keys,
-                default=default_punct_keys,
-                key="ko_punct_filter",
-                help="선택한 부호만 색상 표시",
+            view_mode_ko = st.radio(
+                "보기 모드",
+                ["오류 하이라이트", "문장부호만"],
+                horizontal=True,
+                key="ko_view_mode_toggle",
             )
 
-            punctuation_only_ko = highlight_selected_punctuation(text_ko, selected_punct_keys_ko)
+            selected_chars_ko = (
+                set().union(*(PUNCT_GROUPS[k] for k in selected_punct_keys_ko))
+                if selected_punct_keys_ko else set()
+            )
+            if view_mode_ko == "오류 하이라이트":
+                highlighted_ko = highlight_text_with_spans(
+                    text_ko,
+                    spans_ko if spans_ko else [],
+                    selected_punct_chars=selected_chars_ko,
+                )
+            else:
+                highlighted_ko = highlight_selected_punctuation(text_ko, selected_punct_keys_ko)
+            st.markdown(
+                f"<div style='background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px;'>"
+                f"<pre style='white-space: pre-wrap; background:transparent; margin:0; font-weight:600;'>{highlighted_ko}</pre>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
             punct_counts_ko = Counter(ch for ch in text_ko if ch in PUNCT_COLOR_MAP)
             badge_order_ko = [
                 (".", "종결부호"),
@@ -1806,10 +1824,6 @@ with tab_ko:
 
             st.markdown(
                 f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_ko)}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_ko}</pre>",
                 unsafe_allow_html=True,
             )
 
@@ -1913,11 +1927,17 @@ with tab_en:
 
             spans_en = parse_english_report_with_positions(text_en, report_for_highlight)
 
-            st.markdown(f"#### 🔦 {mode_label_en} 하이라이트")
+            default_punct_keys = list(PUNCT_GROUPS.keys())
+            selected_punct_keys_en = st.multiselect(
+                "문장부호 선택",
+                options=default_punct_keys,
+                default=default_punct_keys,
+                key="en_punct_filter",
+                help="선택한 부호만 색상 표시",
+            )
 
-            if not spans_en:
-                st.info(f"{mode_label_en}으로 하이라이트할 항목이 없습니다.")
-            else:
+            st.markdown(f"#### 🔦 {mode_label_en} 하이라이트")
+            if spans_en:
                 for span in spans_en:
                     if span["line"] is None:
                         st.markdown(
@@ -1928,27 +1948,34 @@ with tab_en:
                             f"- L{span['line']}, C{span['col']} — "
                             f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
                         )
+            else:
+                st.info(f"{mode_label_en}으로 하이라이트할 항목이 없습니다. 원문을 그대로 표시합니다.")
 
-                highlighted_en = highlight_text_with_spans(text_en, spans_en)
-                st.markdown(
-                    f"<div style='background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px;'>"
-                    f"<pre style='white-space: pre-wrap; background:transparent; margin:0;'>{highlighted_en}</pre>"
-                    f"</div>",
-                    unsafe_allow_html=True,
+            selected_chars_en = (
+                set().union(*(PUNCT_GROUPS[k] for k in selected_punct_keys_en))
+                if selected_punct_keys_en else set()
+            )
+            view_mode_en_toggle = st.radio(
+                "보기 모드",
+                ["오류 하이라이트", "문장부호만"],
+                horizontal=True,
+                key="en_view_mode_toggle",
+            )
+            if view_mode_en_toggle == "오류 하이라이트":
+                highlighted_en = highlight_text_with_spans(
+                    text_en,
+                    spans_en if spans_en else [],
+                    selected_punct_chars=selected_chars_en,
                 )
-
-            # 문장부호 전용 하이라이트 뷰
-            st.markdown("#### ✨ 문장부호만 보기")
-            default_punct_keys = list(PUNCT_GROUPS.keys())
-            selected_punct_keys_en = st.multiselect(
-                "하이라이트할 문장부호 선택",
-                options=default_punct_keys,
-                default=default_punct_keys,
-                key="en_punct_filter",
-                help="선택한 부호만 색상 표시",
+            else:
+                highlighted_en = highlight_selected_punctuation(text_en, selected_punct_keys_en)
+            st.markdown(
+                f"<div style='background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px;'>"
+                f"<pre style='white-space: pre-wrap; background:transparent; margin:0; font-weight:600;'>{highlighted_en}</pre>"
+                f"</div>",
+                unsafe_allow_html=True,
             )
 
-            punctuation_only_en = highlight_selected_punctuation(text_en, selected_punct_keys_en)
             punct_counts_en = Counter(ch for ch in text_en if ch in PUNCT_COLOR_MAP)
             badge_order_en = [
                 (".", "종결부호"),
@@ -1968,10 +1995,6 @@ with tab_en:
 
             st.markdown(
                 f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_en)}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_en}</pre>",
                 unsafe_allow_html=True,
             )
 
