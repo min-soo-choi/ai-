@@ -229,18 +229,18 @@ def build_korean_raw_report_for_highlight(raw_json: dict) -> str:
     return (raw_json.get("translated_typo_report") or "").strip()
 
 PUNCT_COLOR_MAP = {
-    ".": "#fff3cd",  # 연노랑 (종결부호)
-    "?": "#f8d7da",  # 연분홍 (물음표)
-    "!": "#f5c6cb",  # 연한 빨강 (느낌표)
-    ",": "#d1ecf1",  # 연하늘 (쉼표)
-    ";": "#d6d8d9",  # 회색 톤 (세미콜론)
-    ":": "#d6d8d9",  # 회색 톤 (콜론)
-    '"': "#e0f7e9",  # 연연두 (쌍따옴표)
-    "“": "#e0f7e9",
-    "”": "#e0f7e9",
-    "'": "#fce9d9",  # 연살구 (작은따옴표)
-    "‘": "#fce9d9",
-    "’": "#fce9d9",
+    ".": "#ffe08a",  # 조금 더 진한 노랑 (종결부호)
+    "?": "#f2a6b3",  # 진한 핑크 (물음표)
+    "!": "#f28b90",  # 진한 빨강 계열 (느낌표)
+    ",": "#9fd3e6",  # 더 진한 하늘 (쉼표)
+    ";": "#bfc2c4",  # 진한 회색 톤 (세미콜론)
+    ":": "#bfc2c4",  # 진한 회색 톤 (콜론)
+    '"': "#b9e6c8",  # 진한 연두 (쌍따옴표)
+    "“": "#b9e6c8",
+    "”": "#b9e6c8",
+    "'": "#f7b58d",  # 진한 살구 (작은따옴표)
+    "‘": "#f7b58d",
+    "’": "#f7b58d",
 }
 
 PUNCT_GROUPS: dict[str, set[str]] = {
@@ -609,6 +609,36 @@ def drop_false_korean_period_errors(report: str) -> str:
             cleaned_lines.append(s)
 
     return "\n".join(cleaned_lines)
+
+
+def drop_false_whitespace_claims(text: str, report: str) -> str:
+    """
+    '불필요한 공백'류를 지적했지만 원문 조각에 공백/제로폭 공백이 전혀 없으면 제거한다.
+    """
+    if not report:
+        return ""
+
+    cleaned: list[str] = []
+    pattern = re.compile(r"^- '(.+?)' → '(.+?)':.*(불필요한 공백|띄어쓰기|공백)", re.UNICODE)
+
+    for line in report.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+
+        m = pattern.match(s)
+        if not m:
+            cleaned.append(s)
+            continue
+
+        original = m.group(1)
+        # 실제 공백/제로폭 공백이 하나도 없으면 오탐으로 간주
+        if not re.search(r"[ \t\u3000\u200b\u200c\u200d]", original):
+            continue
+
+        cleaned.append(s)
+
+    return "\n".join(cleaned)
 
 
 def ensure_final_punctuation_error(text: str, report: str) -> str:
@@ -1204,6 +1234,7 @@ def _review_korean_single_block(korean_text: str) -> Dict[str, Any]:
         final_report,
     )
     filtered = drop_false_korean_period_errors(filtered)
+    filtered = drop_false_whitespace_claims(korean_text, filtered)
     filtered = ensure_final_punctuation_error(korean_text, filtered)
     filtered = ensure_sentence_end_punctuation(korean_text, filtered)
     filtered = dedup_korean_bullet_lines(filtered)
@@ -1697,126 +1728,132 @@ with tab_ko:
         st.success("한국어 검수가 완료되었습니다!")
         st.metric("의심 점수 (1~5) 1점 -> GOOD 5점 -> BAD", f"{float(score):.2f}")
 
-        st.markdown("### 🔍 결과 비교 (Raw vs Final)")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("#### ✅ Final JSON (후처리 적용)")
-            st.json(final_json_display, expanded=False)
-        with col2:
-            st.markdown("#### 🧪 Raw JSON (2차 Judge 기준)")
-            st.json(raw_json_display, expanded=False)
+        # ---------------- 하이라이트 카드 ----------------
+        with st.container():
+            st.markdown("### 🖍 오류 위치 · 하이라이트")
 
-        # 1차/2차 JSON도 보고 싶으면 expander로
-        with st.expander("1차 Detector JSON (필요 시)", expanded=False):
-            st.json(raw_json.get("detector_clean", {}))
-        with st.expander("2차 Judge JSON (필요 시)", expanded=False):
-            st.json(raw_json.get("judge_clean", {}))
+            stage_choice_ko = st.radio(
+                "하이라이트 기준 선택",
+                ["최종(Final)", "2차 Judge", "1차 Detector"],
+                horizontal=True,
+                key="ko_highlight_mode",
+            )
 
-        st.markdown("### 🛠 최종 수정 제안 사항 (최종 기준)")
-        suggestions = extract_korean_suggestions_from_raw(
-            {"translated_typo_report": stage_reports_ko["final"]}
-        )
-        if not suggestions:
-            st.info("보고할 수정 사항이 없습니다.")
-        else:
-            for s in suggestions:
-                st.markdown(s)
+            if stage_choice_ko == "최종(Final)":
+                report_for_highlight = stage_reports_ko["final"]
+                mode_label = "최종(Final) 기준"
+            elif stage_choice_ko == "2차 Judge":
+                report_for_highlight = stage_reports_ko["judge"]
+                mode_label = "2차 Judge 기준"
+            else:
+                report_for_highlight = stage_reports_ko["detector"]
+                mode_label = "1차 Detector 기준"
 
-        # ---------------- 하이라이트 ----------------
-        st.markdown("### 📍 오류 위치 및 하이라이트")
+            spans_ko = parse_korean_report_with_positions(text_ko, report_for_highlight)
 
-        stage_choice_ko = st.radio(
-            "하이라이트 기준 선택",
-            ["최종(Final)", "2차 Judge", "1차 Detector"],
-            horizontal=True,
-            key="ko_highlight_mode",
-        )
+            st.markdown(f"#### 🔦 {mode_label} 하이라이트")
 
-        if stage_choice_ko == "최종(Final)":
-            report_for_highlight = stage_reports_ko["final"]
-            mode_label = "최종(Final) 기준"
-        elif stage_choice_ko == "2차 Judge":
-            report_for_highlight = stage_reports_ko["judge"]
-            mode_label = "2차 Judge 기준"
-        else:
-            report_for_highlight = stage_reports_ko["detector"]
-            mode_label = "1차 Detector 기준"
+            if not spans_ko:
+                st.info(f"{mode_label}으로 하이라이트할 항목이 없습니다.")
+            else:
+                for span in spans_ko:
+                    if span["line"] is None:
+                        st.markdown(
+                            f"- `{span['original']}` → `{span['fixed']}`: {span['message']}"
+                        )
+                    else:
+                        st.markdown(
+                            f"- L{span['line']}, C{span['col']} — "
+                            f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
+                        )
 
-        spans_ko = parse_korean_report_with_positions(text_ko, report_for_highlight)
+                highlighted_ko = highlight_text_with_spans(text_ko, spans_ko)
+                st.markdown(
+                    f"<div style='background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px;'>"
+                    f"<pre style='white-space: pre-wrap; background:transparent; margin:0;'>{highlighted_ko}</pre>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
-        st.markdown(f"#### 🔦 {mode_label} 하이라이트")
+            # 문장부호 전용 하이라이트 뷰 (오류 여부와 무관하게 문장부호 색상만 표시)
+            st.markdown("#### ✨ 문장부호만 보기")
+            default_punct_keys = list(PUNCT_GROUPS.keys())
+            selected_punct_keys_ko = st.multiselect(
+                "하이라이트할 문장부호 선택",
+                options=default_punct_keys,
+                default=default_punct_keys,
+                key="ko_punct_filter",
+                help="선택한 부호만 색상 표시",
+            )
 
-        if not spans_ko:
-            st.info(f"{mode_label}으로 하이라이트할 항목이 없습니다.")
-        else:
-            for span in spans_ko:
-                if span["line"] is None:
-                    st.markdown(
-                        f"- `{span['original']}` → `{span['fixed']}`: {span['message']}"
-                    )
-                else:
-                    st.markdown(
-                        f"- L{span['line']}, C{span['col']} — "
-                        f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
-                    )
+            punctuation_only_ko = highlight_selected_punctuation(text_ko, selected_punct_keys_ko)
+            punct_counts_ko = Counter(ch for ch in text_ko if ch in PUNCT_COLOR_MAP)
+            badge_order_ko = [
+                (".", "종결부호"),
+                ("?", "물음표"),
+                ("!", "느낌표"),
+                (",", "쉼표"),
+                ('"', "쌍따옴표"),
+                ("'", "작은따옴표"),
+            ]
+            badges_ko = []
+            for ch, label in badge_order_ko:
+                count = punct_counts_ko.get(ch, 0)
+                color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
+                badges_ko.append(
+                    f"<span style='background-color: {color}; padding: 2px 6px; border-radius: 4px; margin-right: 6px; display: inline-block;'>{label}: {count}</span>"
+                )
 
-            highlighted_ko = highlight_text_with_spans(text_ko, spans_ko)
             st.markdown(
-                f"<pre style='white-space: pre-wrap;'>{highlighted_ko}</pre>",
+                f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_ko)}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='background:#f2f4f7; border:1px solid #d0d5dd; border-radius:6px; padding:12px;'>"
+                f"<pre style='white-space: pre-wrap; background:transparent; margin:0; font-weight:600;'>{punctuation_only_ko}</pre>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
 
-        # 문장부호 전용 하이라이트 뷰 (오류 여부와 무관하게 문장부호 색상만 표시)
-        st.markdown("#### ✨ 문장부호만 보기")
-        default_punct_keys = list(PUNCT_GROUPS.keys())
-        selected_punct_keys_ko = st.multiselect(
-            "하이라이트할 문장부호 선택",
-            options=default_punct_keys,
-            default=default_punct_keys,
-            key="ko_punct_filter",
-            help="선택한 부호만 색상 표시",
-        )
+            st.caption("※ 동일한 구절이 여러 번 등장하는 경우, 첫 번째 위치가 하이라이트될 수 있습니다.")
+            st.markdown("""
+                <small>
+                <b>문장부호 색상 안내:</b><br>
+                <span style='background-color: #fff3cd; padding: 0 3px;'>.</span> 종결부호 (., etc) &nbsp;
+                <span style='background-color: #f8d7da; padding: 0 3px;'>?</span> 물음표 &nbsp;
+                <span style='background-color: #f5c6cb; padding: 0 3px;'>!</span> 느낌표 &nbsp;
+                <span style='background-color: #d1ecf1; padding: 0 3px;'>,</span> 쉼표 &nbsp;
+                <span style='background-color: #e0f7e9; padding: 0 3px;'>&ldquo;</span> 쌍따옴표 &nbsp;
+                <span style='background-color: #fce9d9; padding: 0 3px;'>&lsquo;</span> 작은따옴표 &nbsp;
+                <span style='background-color: #d6d8d9; padding: 0 3px;'>; :</span> 기타 문장부호
+                </small>
+                """, unsafe_allow_html=True)
 
-        punctuation_only_ko = highlight_selected_punctuation(text_ko, selected_punct_keys_ko)
-        punct_counts_ko = Counter(ch for ch in text_ko if ch in PUNCT_COLOR_MAP)
-        badge_order_ko = [
-            (".", "종결부호"),
-            ("?", "물음표"),
-            ("!", "느낌표"),
-            (",", "쉼표"),
-            ('"', "쌍따옴표"),
-            ("'", "작은따옴표"),
-        ]
-        badges_ko = []
-        for ch, label in badge_order_ko:
-            count = punct_counts_ko.get(ch, 0)
-            color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
-            badges_ko.append(
-                f"<span style='background-color: {color}; padding: 2px 6px; border-radius: 4px; margin-right: 6px; display: inline-block;'>{label}: {count}</span>"
+        # ---------------- 결과 비교 / 제안 사항 카드 ----------------
+        with st.container():
+            st.markdown("### 📊 결과 비교 · 제안")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("#### ✅ Final JSON (후처리 적용)")
+                st.json(final_json_display, expanded=False)
+            with col2:
+                st.markdown("#### 🧪 Raw JSON (2차 Judge 기준)")
+                st.json(raw_json_display, expanded=False)
+
+            with st.expander("1차 Detector JSON (필요 시)", expanded=False):
+                st.json(raw_json.get("detector_clean", {}))
+            with st.expander("2차 Judge JSON (필요 시)", expanded=False):
+                st.json(raw_json.get("judge_clean", {}))
+
+            st.markdown("### 🛠 최종 수정 제안 사항 (최종 기준)")
+            suggestions = extract_korean_suggestions_from_raw(
+                {"translated_typo_report": stage_reports_ko["final"]}
             )
-
-        st.markdown(
-            f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_ko)}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_ko}</pre>",
-            unsafe_allow_html=True,
-        )
-
-        st.caption("※ 동일한 구절이 여러 번 등장하는 경우, 첫 번째 위치가 하이라이트될 수 있습니다.")
-        st.markdown("""
-            <small>
-            <b>문장부호 색상 안내:</b><br>
-            <span style='background-color: #fff3cd; padding: 0 3px;'>.</span> 종결부호 (., etc) &nbsp;
-            <span style='background-color: #f8d7da; padding: 0 3px;'>?</span> 물음표 &nbsp;
-            <span style='background-color: #f5c6cb; padding: 0 3px;'>!</span> 느낌표 &nbsp;
-            <span style='background-color: #d1ecf1; padding: 0 3px;'>,</span> 쉼표 &nbsp;
-            <span style='background-color: #e0f7e9; padding: 0 3px;'>&ldquo;</span> 쌍따옴표 &nbsp;
-            <span style='background-color: #fce9d9; padding: 0 3px;'>&lsquo;</span> 작은따옴표 &nbsp;
-            <span style='background-color: #d6d8d9; padding: 0 3px;'>; :</span> 기타 문장부호
-            </small>
-            """, unsafe_allow_html=True)
+            if not suggestions:
+                st.info("보고할 수정 사항이 없습니다.")
+            else:
+                for s in suggestions:
+                    st.markdown(s)
 
 
 
@@ -1855,128 +1892,136 @@ with tab_en:
         st.success("영어 검수가 완료되었습니다!")
         st.metric("의심 점수 (1~5) 1점 -> GOOD 5점 -> BAD", f"{float(score):.2f}")
 
-        st.markdown("### 🔍 결과 비교 (Raw vs Final)")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("#### ✅ Final JSON (후처리 적용)")
-            st.json(final_json, expanded=False)
-        with col2:
-            st.markdown("#### 🧪 Raw JSON (2차 Judge 기준)")
-            st.json(raw_view, expanded=False)
+        # ---------------- 하이라이트 카드 ----------------
+        with st.container():
+            st.markdown("### 🖍 오류 위치 · 하이라이트")
 
-        st.markdown("#### 🔍 Raw vs Final 차이 요약")
-        diff_md_en = summarize_json_diff(raw_view, final_json)
-        st.markdown(diff_md_en)
+            view_mode_en = st.radio(
+                "하이라이트 기준 선택",
+                ["최종(Final)", "2차 Judge", "1차 Detector"],
+                horizontal=True,
+                key="en_highlight_mode",
+            )
 
-        st.markdown("### 🛠 최종 수정 제안 사항 (최종 기준)")
-        suggestions_en = extract_english_suggestions_from_raw(
-            {"content_typo_report": stage_reports_en["final"]}
-        )
-        if not suggestions_en:
-            st.info("보고할 수정 사항이 없습니다.")
-        else:
-            for s in suggestions_en:
-                st.markdown(s)
+            if view_mode_en == "최종(Final)":
+                report_for_highlight = stage_reports_en["final"]
+                mode_label_en = "최종(Final) 기준"
+            elif view_mode_en == "2차 Judge":
+                report_for_highlight = stage_reports_en["judge"]
+                mode_label_en = "2차 Judge 기준"
+            else:
+                report_for_highlight = stage_reports_en["detector"]
+                mode_label_en = "1차 Detector 기준"
 
-        with st.expander("1차 Detector JSON (필요 시)", expanded=False):
-            st.json(raw_json.get("detector_clean", {}))
-        with st.expander("2차 Judge JSON (필요 시)", expanded=False):
-            st.json(raw_json.get("judge_clean", {}))
+            spans_en = parse_english_report_with_positions(text_en, report_for_highlight)
 
-        st.markdown("### 📍 오류 위치 및 하이라이트")
+            st.markdown(f"#### 🔦 {mode_label_en} 하이라이트")
 
-        view_mode_en = st.radio(
-            "하이라이트 기준 선택",
-            ["최종(Final)", "2차 Judge", "1차 Detector"],
-            horizontal=True,
-            key="en_highlight_mode",
-        )
+            if not spans_en:
+                st.info(f"{mode_label_en}으로 하이라이트할 항목이 없습니다.")
+            else:
+                for span in spans_en:
+                    if span["line"] is None:
+                        st.markdown(
+                            f"- `{span['original']}` → `{span['fixed']}`: {span['message']}"
+                        )
+                    else:
+                        st.markdown(
+                            f"- L{span['line']}, C{span['col']} — "
+                            f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
+                        )
 
-        if view_mode_en == "최종(Final)":
-            report_for_highlight = stage_reports_en["final"]
-            mode_label_en = "최종(Final) 기준"
-        elif view_mode_en == "2차 Judge":
-            report_for_highlight = stage_reports_en["judge"]
-            mode_label_en = "2차 Judge 기준"
-        else:
-            report_for_highlight = stage_reports_en["detector"]
-            mode_label_en = "1차 Detector 기준"
+                highlighted_en = highlight_text_with_spans(text_en, spans_en)
+                st.markdown(
+                    f"<div style='background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px;'>"
+                    f"<pre style='white-space: pre-wrap; background:transparent; margin:0;'>{highlighted_en}</pre>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
-        spans_en = parse_english_report_with_positions(text_en, report_for_highlight)
+            # 문장부호 전용 하이라이트 뷰
+            st.markdown("#### ✨ 문장부호만 보기")
+            default_punct_keys = list(PUNCT_GROUPS.keys())
+            selected_punct_keys_en = st.multiselect(
+                "하이라이트할 문장부호 선택",
+                options=default_punct_keys,
+                default=default_punct_keys,
+                key="en_punct_filter",
+                help="선택한 부호만 색상 표시",
+            )
 
-        st.markdown(f"#### 🔦 {mode_label_en} 하이라이트")
+            punctuation_only_en = highlight_selected_punctuation(text_en, selected_punct_keys_en)
+            punct_counts_en = Counter(ch for ch in text_en if ch in PUNCT_COLOR_MAP)
+            badge_order_en = [
+                (".", "종결부호"),
+                ("?", "물음표"),
+                ("!", "느낌표"),
+                (",", "쉼표"),
+                ('"', "쌍따옴표"),
+                ("'", "작은따옴표"),
+            ]
+            badges_en = []
+            for ch, label in badge_order_en:
+                count = punct_counts_en.get(ch, 0)
+                color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
+                badges_en.append(
+                    f"<span style='background-color: {color}; padding: 2px 6px; border-radius: 4px; margin-right: 6px; display: inline-block;'>{label}: {count}</span>"
+                )
 
-        if not spans_en:
-            st.info(f"{mode_label_en}으로 하이라이트할 항목이 없습니다.")
-        else:
-            for span in spans_en:
-                if span["line"] is None:
-                    st.markdown(
-                        f"- `{span['original']}` → `{span['fixed']}`: {span['message']}"
-                    )
-                else:
-                    st.markdown(
-                        f"- L{span['line']}, C{span['col']} — "
-                        f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
-                    )
-
-            highlighted_en = highlight_text_with_spans(text_en, spans_en)
             st.markdown(
-                f"<pre style='white-space: pre-wrap;'>{highlighted_en}</pre>",
+                f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_en)}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='background:#f2f4f7; border:1px solid #d0d5dd; border-radius:6px; padding:12px;'>"
+                f"<pre style='white-space: pre-wrap; background:transparent; margin:0; font-weight:600;'>{punctuation_only_en}</pre>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
 
-        # 문장부호 전용 하이라이트 뷰
-        st.markdown("#### ✨ 문장부호만 보기")
-        default_punct_keys = list(PUNCT_GROUPS.keys())
-        selected_punct_keys_en = st.multiselect(
-            "하이라이트할 문장부호 선택",
-            options=default_punct_keys,
-            default=default_punct_keys,
-            key="en_punct_filter",
-            help="선택한 부호만 색상 표시",
-        )
+            st.caption("※ 동일한 구절이 여러 번 등장하는 경우, 첫 번째 위치가 하이라이트될 수 있습니다.")
+            st.markdown("""
+                <small>
+                <b>문장부호 색상 안내:</b><br>
+                <span style='background-color: #fff3cd; padding: 0 3px;'>.</span> 종결부호 (., etc) &nbsp;
+                <span style='background-color: #f8d7da; padding: 0 3px;'>?</span> 물음표 &nbsp;
+                <span style='background-color: #f5c6cb; padding: 0 3px;'>!</span> 느낌표 &nbsp;
+                <span style='background-color: #d1ecf1; padding: 0 3px;'>,</span> 쉼표 &nbsp;
+                <span style='background-color: #e0f7e9; padding: 0 3px;'>&ldquo;</span> 쌍따옴표 &nbsp;
+                <span style='background-color: #fce9d9; padding: 0 3px;'>&lsquo;</span> 작은따옴표 &nbsp;
+                <span style='background-color: #d6d8d9; padding: 0 3px;'>; :</span> 기타 문장부호
+                </small>
+                """, unsafe_allow_html=True)
 
-        punctuation_only_en = highlight_selected_punctuation(text_en, selected_punct_keys_en)
-        punct_counts_en = Counter(ch for ch in text_en if ch in PUNCT_COLOR_MAP)
-        badge_order_en = [
-            (".", "종결부호"),
-            ("?", "물음표"),
-            ("!", "느낌표"),
-            (",", "쉼표"),
-            ('"', "쌍따옴표"),
-            ("'", "작은따옴표"),
-        ]
-        badges_en = []
-        for ch, label in badge_order_en:
-            count = punct_counts_en.get(ch, 0)
-            color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
-            badges_en.append(
-                f"<span style='background-color: {color}; padding: 2px 6px; border-radius: 4px; margin-right: 6px; display: inline-block;'>{label}: {count}</span>"
+        # 결과 비교 / 제안 사항 카드
+        with st.container():
+            st.markdown("### 📊 결과 비교 · 제안")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("#### ✅ Final JSON (후처리 적용)")
+                st.json(final_json, expanded=False)
+            with col2:
+                st.markdown("#### 🧪 Raw JSON (2차 Judge 기준)")
+                st.json(raw_view, expanded=False)
+
+            st.markdown("#### 🔍 Raw vs Final 차이 요약")
+            diff_md_en = summarize_json_diff(raw_view, final_json)
+            st.markdown(diff_md_en)
+
+            st.markdown("### 🛠 최종 수정 제안 사항 (최종 기준)")
+            suggestions_en = extract_english_suggestions_from_raw(
+                {"content_typo_report": stage_reports_en["final"]}
             )
+            if not suggestions_en:
+                st.info("보고할 수정 사항이 없습니다.")
+            else:
+                for s in suggestions_en:
+                    st.markdown(s)
 
-        st.markdown(
-            f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_en)}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_en}</pre>",
-            unsafe_allow_html=True,
-        )
-
-        st.caption("※ 동일한 구절이 여러 번 등장하는 경우, 첫 번째 위치가 하이라이트될 수 있습니다.")
-        st.markdown("""
-             <small>
-            <b>문장부호 색상 안내:</b><br>
-            <span style='background-color: #fff3cd; padding: 0 3px;'>.</span> 종결부호 (., etc) &nbsp;
-            <span style='background-color: #f8d7da; padding: 0 3px;'>?</span> 물음표 &nbsp;
-            <span style='background-color: #f5c6cb; padding: 0 3px;'>!</span> 느낌표 &nbsp;
-            <span style='background-color: #d1ecf1; padding: 0 3px;'>,</span> 쉼표 &nbsp;
-            <span style='background-color: #e0f7e9; padding: 0 3px;'>&ldquo;</span> 쌍따옴표 &nbsp;
-            <span style='background-color: #fce9d9; padding: 0 3px;'>&lsquo;</span> 작은따옴표 &nbsp;
-            <span style='background-color: #d6d8d9; padding: 0 3px;'>; :</span> 기타 문장부호
-            </small>
-            """, unsafe_allow_html=True)
+            with st.expander("1차 Detector JSON (필요 시)", expanded=False):
+                st.json(raw_json.get("detector_clean", {}))
+            with st.expander("2차 Judge JSON (필요 시)", expanded=False):
+                st.json(raw_json.get("judge_clean", {}))
 
 
 
@@ -2264,6 +2309,13 @@ with tab_about:
    - suspicion_score (1~5)  
    - translated_typo_report  
    - raw vs final JSON 비교 가능
+
+---
+
+## 🧪 2-패스 구조 (Detector → Judge)
+- **1차 Detector**: 가능한 많은 오류 후보를 넓게 탐지 (약간 과검출 허용)
+- **2차 Judge**: 의미 변경/스타일 제안/환각을 필터링해 **객관적 오류만 남김**
+- UI에서 Detector/Judge/Final을 각각 선택해 하이라이트와 리포트를 비교할 수 있습니다.
 
 ---
 """)

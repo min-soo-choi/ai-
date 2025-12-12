@@ -561,6 +561,36 @@ def drop_punctuation_space_style(report: str) -> str:
     return "\n".join(cleaned)
 
 
+def drop_false_whitespace_claims(text: str, report: str) -> str:
+    """
+    '불필요한 공백/띄어쓰기' 지적이지만 원문 조각에 실제 공백/제로폭 공백이 없으면 제거.
+    """
+    if not report:
+        return ""
+
+    cleaned: List[str] = []
+    pattern = re.compile(r"^- '(.+?)' → '(.+?)':.*(불필요한 공백|띄어쓰기|공백)", re.UNICODE)
+
+    for line in report.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+
+        m = pattern.match(s)
+        if not m:
+            cleaned.append(s)
+            continue
+
+        original = m.group(1)
+        if not re.search(r"[ \t\u3000\u200b\u200c\u200d]", original):
+            # 실제 공백이 없으면 오탐으로 간주
+            continue
+
+        cleaned.append(s)
+
+    return "\n".join(cleaned)
+
+
 def sanitize_report(original_text: str, report: str) -> str:
     """
     모든 후처리 필터를 순차 적용.
@@ -588,6 +618,9 @@ def sanitize_report(original_text: str, report: str) -> str:
 
     # 6) 마침표/쉼표 뒤 공백 스타일 지적 제거
     r = drop_punctuation_space_style(r)
+
+    # 6-1) 실제 공백이 없는 데 '불필요한 공백/띄어쓰기' 지적 → 제거
+    r = drop_false_whitespace_claims(original_text, r)
 
     # 7) 원문에 없는 조각 제거 (띄어쓰기 normalize 기반)
     r = drop_lines_not_in_source(original_text, r)
