@@ -3,12 +3,15 @@
 import json
 import time
 import re
+import html
+from collections import Counter
 from typing import Dict, Any, List
 
 import streamlit as st
 import google.generativeai as genai
 
 from sheet_review import run_sheet_review
+
 
 # --------------------------
 # 0. Gemini 설정 (키는 secrets에서만 읽기)
@@ -25,6 +28,370 @@ model = genai.GenerativeModel("gemini-2.0-flash-001")
 # -------------------------------------------------
 # 공통 유틸
 # -------------------------------------------------
+
+# 한 chunk당 최대 길이 (원하는 값으로 조정 가능)
+MAX_KO_CHUNK_LEN = 1000  # 한글 800~1200자 정도면 안정적
+
+def split_korean_text_into_chunks(text: str, max_len: int = MAX_KO_CHUNK_LEN) -> List[str]:
+    """
+    긴 한국어 텍스트를 여러 chunk로 나눈다.
+    - 기본 기준: max_len 글자
+    - 가능하면 줄바꿈(\n) 앞에서 끊어서 문단 단위에 가깝게 유지
+    """
+    if not text:
+        return []
+
+    text = text.replace("\r\n", "\n")
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: List[str] = []
+    n = len(text)
+    start = 0
+
+    while start < n:
+        end = min(start + max_len, n)
+
+        # end 근처에서 줄바꿈 기준으로 끊을 수 있으면 거기서 끊기
+        split_pos = text.rfind("\n", start + int(max_len * 0.4), end)
+        if split_pos == -1 or split_pos <= start:
+            split_pos = end
+
+        chunk = text[start:split_pos].strip("\n")
+        if chunk:
+            chunks.append(chunk)
+
+        start = split_pos
+
+    return chunks
+
+
+def _parse_report_with_pattern(source_text: str, report: str, pattern: re.Pattern[str]) -> List[Dict[str, Any]]:
+    """
+    공용 파서: "- '원문' → '수정안': 설명" 포맷을 받아 위치 정보를 계산한다.
+    pattern: 언어별 허용 따옴표/화살표를 반영한 정규식.
+    """
+    if not report:
+        return []
+
+    # 원문 텍스트를 한 줄씩 쪼개고, 각 줄의 시작 offset을 기록
+    lines = source_text.splitlines(keepends=True)
+    line_starts: List[int] = []
+    offset = 0
+    for ln in lines:
+        line_starts.append(offset)
+        offset += len(ln)
+
+    def index_to_line_col(idx: int) -> tuple[int, int]:
+        line_no = 1
+        for i, start in enumerate(line_starts):
+            if i + 1 < len(line_starts) and line_starts[i + 1] <= idx:
+                line_no += 1
+            else:
+                break
+        line_start_idx = line_starts[line_no - 1]
+        col_no = idx - line_start_idx + 1
+        return line_no, col_no
+
+    results: List[Dict[str, Any]] = []
+
+    for line in report.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+
+        m = pattern.match(s)
+        if not m:
+            continue
+
+        orig = m.group(1)
+        fixed = m.group(2)
+        msg = m.group(3)
+
+        idx = source_text.find(orig)
+        if idx == -1:
+            results.append({
+                "original": orig,
+                "fixed": fixed,
+                "message": msg,
+                "line": None,
+                "col": None,
+            })
+            continue
+
+        line_no, col_no = index_to_line_col(idx)
+        results.append({
+            "original": orig,
+            "fixed": fixed,
+            "message": msg,
+            "line": line_no,
+            "col": col_no,
+        })
+
+    return results
+
+
+def parse_korean_report_with_positions(source_text: str, report: str) -> List[Dict[str, Any]]:
+    """
+    한국어용 리포트 파서
+    - 기본: '- "원문" → "수정안": 설명' 형식
+    - 허용: 따옴표 유무 모두 허용, 스마트 따옴표 허용, 종결부호 누락/여분 따옴표도 관대하게 매칭
+    - 화살표는 → 또는 -> 허용
+    """
+    patterns = [
+        # 1) 정규 포맷: 양쪽에 따옴표 있음
+        re.compile(
+            r"""^-\s*['"“”‘’](.+?)['"“”‘’]\s*(?:→|->)\s*['"“”‘’](.+?)['"“”‘’]\s*:\s*(.+?)\s*['"“”‘’]?$""",
+            re.UNICODE,
+        ),
+        # 2) 따옴표가 아예 없는 경우도 허용
+        re.compile(
+            r"""^-\s*(.+?)\s*(?:→|->)\s*(.+?)\s*:\s*(.+?)\s*['"“”‘’]?$""",
+            re.UNICODE,
+        ),
+    ]
+
+    for pat in patterns:
+        results = _parse_report_with_pattern(source_text, report, pat)
+        if results:
+            return results
+
+    return []
+
+
+def parse_english_report_with_positions(source_text: str, report: str) -> List[Dict[str, Any]]:
+    """
+    영어용 리포트 파서
+    - 포맷은 동일하지만 영어 전용 규칙을 분리할 수 있도록 별도 함수로 유지
+    """
+    pattern = re.compile(
+        r"""^-\s*['"“”‘’](.+?)['"“”‘’]\s*(?:→|->)\s*['"“”‘’](.+?)['"“”‘’]\s*:\s*(.+)$""",
+        re.UNICODE,
+    )
+    return _parse_report_with_pattern(source_text, report, pattern)
+
+
+# ✅ 하위 호환: 기본 파서는 한국어 규칙으로 동작
+def parse_report_with_positions(source_text: str, report: str) -> List[Dict[str, Any]]:
+    return parse_korean_report_with_positions(source_text, report)
+
+def build_english_raw_report_for_highlight(raw_json: dict) -> str:
+    """
+    영어 raw_json에서 하이라이트용 리포트 문자열을 만든다.
+    - two_pass_single_en 모드: 1차 Detector 기준 리포트 사용 (더 과검출)
+    - 그 외: content_typo_report를 그대로 사용
+    """
+    if not isinstance(raw_json, dict):
+        return ""
+
+    mode = raw_json.get("mode")
+
+    if mode == "two_pass_single_en":
+        draft = raw_json.get("initial_report_from_detector", "") or ""
+        return draft.strip()
+
+    # fallback: 혹시 모드를 안 쓴 경우
+    return (raw_json.get("content_typo_report") or "").strip()
+
+
+
+
+def build_korean_raw_report_for_highlight(raw_json: dict) -> str:
+    """
+    한국어 raw_json에서 하이라이트용 리포트 문자열을 만든다.
+    - single block: raw_json["translated_typo_report"] 그대로 사용
+    - chunked: 각 chunk.raw.translated_typo_report를 블록 헤더와 함께 이어붙임
+    """
+    if not isinstance(raw_json, dict):
+        return ""
+
+    # chunking 모드
+    if raw_json.get("mode") == "chunked":
+        st.info("※ 텍스트가 길어 여러 블록으로 나뉘어 검사되었으며, \ 1차/2차 JSON은 chunk별 raw 정보로만 존재합니다.")
+    else:
+        with st.expander("1차 Detector JSON (필요 시)", expanded=False):
+            st.json(raw_json.get("detector_clean", {}))
+        with st.expander("2차 Judge JSON (필요 시)", expanded=False):
+            st.json(raw_json.get("judge_clean", {}))
+        lines: List[str] = []
+        for chunk in raw_json.get("chunks", []):
+            idx = chunk.get("index")
+            raw = chunk.get("raw") or {}
+            report = (raw.get("translated_typo_report") or "").strip()
+            if not report:
+                continue
+            if idx is not None:
+                lines.append(f"# [블록 {idx}]")
+            lines.append(report)
+        return "\n".join(lines)
+
+    # 단일 블록 모드
+    return (raw_json.get("translated_typo_report") or "").strip()
+
+PUNCT_COLOR_MAP = {
+    ".": "#fff3cd",  # 연노랑 (종결부호)
+    "?": "#f8d7da",  # 연분홍 (물음표)
+    "!": "#f5c6cb",  # 연한 빨강 (느낌표)
+    ",": "#d1ecf1",  # 연하늘 (쉼표)
+    ";": "#d6d8d9",  # 회색 톤 (세미콜론)
+    ":": "#d6d8d9",  # 회색 톤 (콜론)
+    '"': "#e0f7e9",  # 연연두 (쌍따옴표)
+    "“": "#e0f7e9",
+    "”": "#e0f7e9",
+    "'": "#fce9d9",  # 연살구 (작은따옴표)
+    "‘": "#fce9d9",
+    "’": "#fce9d9",
+}
+
+PUNCT_GROUPS: dict[str, set[str]] = {
+    "종결부호(.)": {"."},
+    "물음표(?)": {"?"},
+    "느낌표(!)": {"!"},
+    "쉼표(,)": {","},
+    "쌍따옴표": {'"', "“", "”"},
+    "작은따옴표": {"'", "‘", "’"},
+}
+
+# 한국어/영어에서 자주 쓰는 문장부호 세트
+PUNCT_CHARS = set(PUNCT_COLOR_MAP.keys()) | set([
+    # 큰따옴표/작은따옴표
+    '"', "'", "“", "”", "‘", "’",
+    # 괄호류
+    "(", ")", "[", "]", "{", "}",
+    "「", "」", "『", "』", "〈", "〉", "《", "》",
+    # 기타
+    "…", "·",
+])
+
+
+def highlight_text_with_spans(source_text: str, spans: List[Dict[str, Any]]) -> str:
+    """
+    spans: parse_report_with_positions() 결과.
+    - spans에 해당하는 'original' 구간은 <mark>...</mark> 로 감싸서 오류 하이라이트.
+    - 그 밖의 영역에 있는 문장부호는 기호별로 색을 다르게 주어 <span style="...">로 감싼다.
+
+    ⚠️ 설계:
+      - 오류 구간(<mark>) 안의 문장부호는 추가 색칠 없이 mark만 적용 (이미 강한 하이라이트).
+      - 오류가 아닌 영역의 문장부호만 색상 하이라이트.
+    """
+    if not source_text:
+        return ""
+
+    # 1) 오류 구간 interval 계산
+    intervals: List[tuple[int, int]] = []
+
+    if spans:
+        for span in spans:
+            orig = span.get("original")
+            if not orig:
+                continue
+            start = source_text.find(orig)
+            if start == -1:
+                continue
+            end = start + len(orig)
+            intervals.append((start, end))
+
+    # intervals가 없으면, 오류는 없고 문장부호만 색칠
+    if not intervals:
+        result_parts: List[str] = []
+        for ch in source_text:
+            if ch in PUNCT_CHARS:
+                color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
+                result_parts.append(
+                    f"<span style='background-color: {color}; padding: 0 1px;'>{html.escape(ch)}</span>"
+                )
+            else:
+                result_parts.append(html.escape(ch))
+        return "".join(result_parts)
+
+    # 2) 오류 interval 정리 (겹치는 구간 병합)
+    intervals.sort(key=lambda x: x[0])
+    merged_intervals: List[tuple[int, int]] = []
+    cur_start, cur_end = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= cur_end:  # 겹치면 병합
+            cur_end = max(cur_end, e)
+        else:
+            merged_intervals.append((cur_start, cur_end))
+            cur_start, cur_end = s, e
+    merged_intervals.append((cur_start, cur_end))
+
+    # 3) 한 글자씩 순회하며 HTML 생성
+    result_parts: List[str] = []
+    idx = 0
+    interval_idx = 0
+    in_error = False
+    cur_err_end = None
+
+    while idx < len(source_text):
+        # 현재 위치가 새로운 오류 interval의 시작인지 확인
+        if interval_idx < len(merged_intervals):
+            start, end = merged_intervals[interval_idx]
+        else:
+            start, end = None, None
+
+        if (not in_error) and (start is not None) and (idx == start):
+            # 오류 구간 시작
+            in_error = True
+            cur_err_end = end
+            result_parts.append("<mark>")
+
+        ch = source_text[idx]
+
+        if in_error:
+            # 오류 구간 안에서는 문장부호 색칠 X, mark만 사용
+            result_parts.append(html.escape(ch))
+            idx += 1
+
+            # 오류 구간 끝났는지 체크
+            if cur_err_end is not None and idx >= cur_err_end:
+                result_parts.append("</mark>")
+                in_error = False
+                interval_idx += 1
+                cur_err_end = None
+        else:
+            # 오류 구간 밖: 문장부호면 색상 하이라이트
+            if ch in PUNCT_CHARS:
+                color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
+                result_parts.append(
+                    f"<span style='background-color: {color}; padding: 0 1px;'>{html.escape(ch)}</span>"
+                )
+            else:
+                result_parts.append(html.escape(ch))
+            idx += 1
+
+    # 혹시 오류 구간이 열린 채로 끝난 경우 닫아주기 (이론상 거의 없음)
+    if in_error:
+        result_parts.append("</mark>")
+
+    return "".join(result_parts)
+
+
+def highlight_selected_punctuation(source_text: str, selected_keys: list[str]) -> str:
+    """
+    선택된 문장부호 그룹만 색상 하이라이트하고 나머지는 일반 텍스트로 보여준다.
+    """
+    if not source_text:
+        return ""
+
+    selected_chars: set[str] = set()
+    for key in selected_keys:
+        selected_chars.update(PUNCT_GROUPS.get(key, set()))
+
+    result_parts: List[str] = []
+    for ch in source_text:
+        if ch in selected_chars and ch in PUNCT_COLOR_MAP:
+            color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
+            result_parts.append(
+                f"<span style='background-color: {color}; padding: 0 3px; font-weight: 700; font-size: 1.1em; border-radius: 3px;'>{html.escape(ch)}</span>"
+            )
+        else:
+            result_parts.append(html.escape(ch))
+    return "".join(result_parts)
+
+
+
+
 def analyze_text_with_gemini(prompt: str, max_retries: int = 5) -> dict:
     """
     단일 텍스트 검사용 Gemini 호출.
@@ -92,6 +459,11 @@ def drop_lines_not_in_source(source_text: str, report: str) -> str:
 
     cleaned: List[str] = []
     pattern = re.compile(r"^- '(.+?)' → '(.+?)':", re.UNICODE)
+    
+    pattern = re.compile(
+        r"""^-\s*(['"])(.+?)\1\s*(?:→|->)\s*(['"])(.+?)\3\s*:\s*(.+)$""",
+        re.UNICODE,
+    )
 
     for line in report.splitlines():
         s = line.strip()
@@ -118,6 +490,12 @@ def clean_self_equal_corrections(report: str) -> str:
     원문과 수정안이 완전히 같은 줄은 제거한다.
     (주로 영어 쪽 content_typo_report에 사용)
     """
+    
+    pattern = re.compile(
+    r"""^-\s*(['"])(.+?)\1\s*(?:→|->)\s*(['"])(.+?)\3\s*:""",
+    re.UNICODE,
+)
+
     if not report:
         return ""
 
@@ -151,6 +529,12 @@ def drop_false_period_errors(english_text: str, report: str) -> str:
     리포트에서 '마침표 없음'류 문장을 제거.
     (거짓 양성 줄이기용)
     """
+    
+    pattern = re.compile(
+    r"""^-\s*(['"])(.+?)\1\s*(?:→|->)\s*(['"])(.+?)\3\s*:""",
+    re.UNICODE,
+)
+
     if not report:
         return ""
 
@@ -350,6 +734,12 @@ def dedup_korean_bullet_lines(report: str) -> str:
     - 완전히 동일한 줄은 하나만 남김
     - '불필요한 마침표'류에서 원문이 부분 문자열 관계이면 더 긴 쪽만 유지
     """
+    
+    pattern = re.compile(
+    r"""^-\s*(['"])(.+?)\1\s*(?:→|->)\s*(['"])(.+?)\3\s*:""",
+    re.UNICODE,
+    )
+
     if not report:
         return ""
 
@@ -475,7 +865,236 @@ def validate_and_clean_analysis(result: dict, original_english_text: str | None 
 # -------------------------------------------------
 # 1-A. 한국어 단일 텍스트 검수 프롬프트 + 래퍼
 # -------------------------------------------------
+
+def create_korean_detector_prompt_for_text(korean_text: str) -> str:
+    """
+    1차 패스: Detector
+    - 가능한 많은 '잠재적 오류 후보'를 찾는 역할 (약간 과검출 허용)
+    """
+    safe_text = json.dumps(korean_text, ensure_ascii=False)
+
+    prompt = f"""
+당신은 1차 **Korean text proofreader (Detector)**입니다.
+당신의 임무는 아래 한국어 텍스트에서 발생할 수 있는
+**모든 잠재적 오류 후보를 최대한 많이 탐지하는 것**입니다.
+
+이 단계에서는 약간의 과잉 탐지(False Positive)를 허용합니다.
+(2차 Judge 단계에서 의미 변경·스타일 제안 등은 제거됩니다.)
+
+출력은 반드시 아래 4개의 key만 포함하는 **단일 JSON 객체**여야 합니다.
+- "suspicion_score": 1~5 정수
+- "content_typo_report": "" (비워두기 — 영어용 필드)
+- "translated_typo_report": "- '원문' → '수정안': 설명" 형식의 줄을 여러 개 포함한 문자열 (없으면 "")
+- "markdown_report": "" (항상 빈 문자열)
+
+모든 설명은 반드시 **한국어로** 작성해야 합니다.
+
+------------------------------------------------------------
+# 입력 텍스트 (JSON 문자열)
+------------------------------------------------------------
+
+아래는 전체 한국어 텍스트를 JSON 문자열로 인코딩한 값입니다.
+이 값을 그대로 디코딩한 텍스트(plain_korean)를 기준으로만 검수해야 합니다.
+
+plain_korean_json: {safe_text}
+
+- plain_korean_json을 디코딩한 결과를 plain_korean이라고 부릅니다.
+- "- '원문' → '수정안': 설명" 형식에서 '원문'은
+  반드시 plain_korean 안에 실제로 존재하는 부분 문자열이어야 합니다.
+
+------------------------------------------------------------
+# 1. 이 단계에서 꼭 잡아야 하는 오류 (넓게 탐지)
+------------------------------------------------------------
+
+- 명백한 오탈자, 철자 오류
+- 잘못된 띄어쓰기/붙여쓰기
+- 조사·어미 오용
+- 문장부호 오류 (마침표/쉼표/따옴표 짝/괄호 짝 등)
+- 단어 내부가 이상하게 분리된 경우 (예: "된 다", "하 였다" 등)
+
+이 단계에서는 다소 애매한 것까지 **후보로 잡아도** 괜찮습니다.
+2차 Judge가 의미 변경/스타일 제안 등을 필터링합니다.
+
+이제 plain_korean_json을 디코딩하여 plain_korean을 얻은 뒤,
+위 기준에 따라 "- '원문' → '수정안': 설명" 형식으로 translated_typo_report를 생성하십시오.
+"""
+    return prompt
+
+
+def create_korean_judge_prompt_for_text(korean_text: str, draft_report: str) -> str:
+    """
+    2차 패스: Judge
+    - 1차 Detector가 만든 후보들(draft_report) 중에서
+      '의미를 바꾸지 않는 객관적인 오류 수정'만 남기고 나머지를 제거하는 역할.
+    """
+    safe_text = json.dumps(korean_text, ensure_ascii=False)
+    safe_report = json.dumps(draft_report, ensure_ascii=False)
+
+    prompt = f"""
+당신은 2차 **Korean text proofreader (Judge)**입니다.
+
+역할:
+- 1차 Detector가 만든 오류 후보 목록(draft_report) 중에서
+  **의미를 바꾸지 않는 객관적인 오류만 남기고 나머지는 모두 제거**하는 것입니다.
+
+------------------------------------------------------------
+# 입력 1: 전체 한국어 원문 (JSON 문자열)
+------------------------------------------------------------
+plain_korean_json: {safe_text}
+
+- plain_korean_json을 디코딩한 결과를 plain_korean이라고 부릅니다.
+
+------------------------------------------------------------
+# 입력 2: 1차 Detector의 후보 리포트 (JSON 문자열)
+------------------------------------------------------------
+draft_report_json: {safe_report}
+
+- draft_report_json은 문자열이며,
+  내부 형식은 "- '원문' → '수정안': 설명" 줄들이 줄바꿈으로 이어진 형태입니다.
+
+각 줄에 대해 아래 기준으로 **채택/제거 여부**를 판단하십시오.
+
+------------------------------------------------------------
+# 채택 기준 (모든 조건을 만족해야 함)
+------------------------------------------------------------
+
+1. '원문'은 plain_korean 안에 실제로 존재하는 부분 문자열이어야 한다.
+2. '수정안'은 다음과 같은 **형식적·객관적 수정**만 포함해야 한다.
+   - 띄어쓰기/붙여쓰기 수정
+   - 조사/어미 교정
+   - 명백한 오탈자·철자 오류
+   - 문장부호(마침표, 쉼표, 따옴표, 괄호 등) 교정
+3. 의미를 바꾸는 어휘 변경이나 문장 구조 변경은 모두 제거한다.
+4. 자연스러운 표현, 문체 개선, 톤 조정, 길이 줄이기/늘리기 등
+   **스타일/표현 개선 목적의 수정**은 모두 제거한다.
+5. plain_korean에 존재하지 않는 단어·구절을 '원문'으로 인용한 줄은 제거한다.
+
+------------------------------------------------------------
+# 출력
+------------------------------------------------------------
+
+반환 값은 반드시 아래 4개의 key를 가진 **단일 JSON 객체**여야 합니다.
+- "suspicion_score": 1~5 정수 (남은 오류 후보의 심각도에 따라 판단)
+- "content_typo_report": "" (비워두기)
+- "translated_typo_report":
+    draft_report_json에 포함된 줄들 중에서
+    위 기준을 만족하는 줄만 남긴 "- '원문' → '수정안': 설명" 문자열
+    (각 줄은 줄바꿈으로 구분)
+- "markdown_report": "" (항상 빈 문자열)
+
+draft_report_json에 있던 줄이라도, 위 기준을 만족하지 못하면
+해당 줄은 완전히 제거하여 translated_typo_report에 포함하지 마십시오.
+"""
+    return prompt
+
+# -------- Stage helpers (Detector / Judge / Final) --------
+
+def get_korean_stage_reports(raw_bundle: dict, final_report: str) -> dict:
+    """
+    한국어 1차 / 2차 / 최종 리포트 문자열을 stage별로 돌려준다.
+    return 예시:
+    {
+        "detector": "...",
+        "judge": "...",
+        "final": "..."
+    }
+    """
+    if not isinstance(raw_bundle, dict):
+        raw_bundle = {}
+
+    detector_report = ""
+    judge_report = ""
+
+    # chunked 모드: 블록별 리포트를 헤더와 함께 이어붙인다.
+    if raw_bundle.get("mode") == "chunked":
+        det_lines: list[str] = []
+        judge_lines: list[str] = []
+        for chunk in raw_bundle.get("chunks", []):
+            idx = chunk.get("index")
+            raw = chunk.get("raw") or {}
+
+            det_line = ""
+            det_line = (raw.get("initial_report_from_detector") or "").strip()
+            if not det_line:
+                det_clean = raw.get("detector_clean") or {}
+                if isinstance(det_clean, dict):
+                    det_line = (det_clean.get("translated_typo_report") or "").strip()
+
+            judge_line = (raw.get("final_report_before_rule_postprocess") or "").strip()
+            if not judge_line:
+                judge_clean = raw.get("judge_clean") or {}
+                if isinstance(judge_clean, dict):
+                    judge_line = (judge_clean.get("translated_typo_report") or "").strip()
+            if not judge_line:
+                judge_line = (raw.get("translated_typo_report") or "").strip()
+
+            header = f"# [블록 {idx}]" if idx is not None else None
+            if det_line:
+                if header:
+                    det_lines.append(header)
+                det_lines.append(det_line)
+            if judge_line:
+                if header:
+                    judge_lines.append(header)
+                judge_lines.append(judge_line)
+
+        detector_report = "\n".join(det_lines).strip()
+        judge_report = "\n".join(judge_lines).strip()
+
+    else:
+        # 단일 블록 모드
+        detector_clean = raw_bundle.get("detector_clean") or {}
+        if isinstance(detector_clean, dict):
+            detector_report = (detector_clean.get("translated_typo_report") or "").strip()
+
+        judge_clean = raw_bundle.get("judge_clean") or {}
+        if isinstance(judge_clean, dict):
+            judge_report = (judge_clean.get("translated_typo_report") or "").strip()
+        if not judge_report:
+            judge_report = (raw_bundle.get("translated_typo_report") or "").strip()
+
+    return {
+        "detector": detector_report,
+        "judge": judge_report,
+        "final": (final_report or "").strip(),
+    }
+
+
+def get_english_stage_reports(raw_bundle: dict, final_report: str) -> dict:
+    """
+    영어 1차 / 2차 / 최종 리포트 반환
+    """
+    if not isinstance(raw_bundle, dict):
+        raw_bundle = {}
+
+    # 1차 Detector: initial_report_from_detector 우선
+    detector_report = (raw_bundle.get("initial_report_from_detector") or "").strip()
+    if not detector_report:
+        detector_clean = raw_bundle.get("detector_clean") or {}
+        if isinstance(detector_clean, dict):
+            detector_report = (detector_clean.get("content_typo_report") or "").strip()
+
+    # 2차 Judge: final_report_before_rule_postprocess 우선
+    judge_report = (raw_bundle.get("final_report_before_rule_postprocess") or "").strip()
+    if not judge_report:
+        judge_clean = raw_bundle.get("judge_clean") or {}
+        if isinstance(judge_clean, dict):
+            judge_report = (judge_clean.get("content_typo_report") or "").strip()
+    if not judge_report:
+        judge_report = (raw_bundle.get("content_typo_report") or "").strip()
+
+    return {
+        "detector": detector_report,
+        "judge": judge_report,
+        "final": (final_report or "").strip(),
+    }
+
+
 def create_korean_review_prompt_for_text(korean_text: str) -> str:
+    
+     # 원문을 JSON 문자열로 한 번 감싸서, 인용부호/줄바꿈/특수문자를 안전하게 전달
+    safe_text = json.dumps(korean_text, ensure_ascii=False)
+    
     prompt = f"""
 당신은 기계적으로 동작하는 **Korean text proofreader**입니다.
 당신의 유일한 임무는 아래 한국어 텍스트에서 **객관적이고 검증 가능한 오류만** 찾아내는 것입니다.
@@ -508,49 +1127,306 @@ def create_korean_review_prompt_for_text(korean_text: str) -> str:
 # 1. 한국어에서 반드시 잡아야 하는 객관적 오류
 ------------------------------------------------------------
 
-(중략 – sheet 프롬프트와 동일 규칙)
+(A) 오탈자 / 철자 오류  
+(B) 조사·어미 오류  
+(C) 단어 내부 불필요한 공백  
+(D) 반복 오타  
+(E) 명백한 띄어쓰기 오류  
+(F) 문장부호 오류  
+   - 문장 끝에 종결부호 없음  
+   - 따옴표 짝 불일치  
+   - 명백히 잘못된 쉼표  
+   - 문장 중간의 불필요한 마침표/쉼표  
+
+[G] 문장부호 뒤 공백 규칙 (중요)
+- 문장 끝에 마침표/물음표/느낌표가 있고, 그 뒤에서 새로운 문장이 시작될 경우,
+  문장부호 뒤의 공백은 **정상이며 오타가 아니다.**
+- 단어 내부에서 불필요한 공백(예: '흘 린다', '된 다')만 오류로 인정한다.
+
+============================================================
+# 2. OUTPUT FORMAT (JSON Only)
+============================================================
+오류가 있을 경우 한 줄씩 bullet:
+
+"- '원문' → '수정안': 오류 설명"
 
 ------------------------------------------------------------
 # 3. 검사할 텍스트
 ------------------------------------------------------------
 
-plain_korean: "{korean_text}"
+아래는 검수할 한국어 전체 텍스트를 JSON 문자열로 인코딩한 값입니다.
+이 값을 그대로 문자열로 복원하여 검수에 사용하세요.
 
-이제 위 규칙을 지키며 위의 한국어 텍스트를 검수하세요.
+plain_korean_json: {safe_text}
+
+- plain_korean_json 값은 JSON 인코딩된 문자열입니다.
+- 이 값을 그대로 디코딩한 텍스트(plain_korean)를 기준으로만
+  '- '원문' → '수정안': ...' 형식의 리포트를 생성해야 합니다.
+- '원문' 부분은 반드시 plain_korean 안에 실제로 존재하는 부분 문자열이어야 합니다.
+
+이제 위 규칙을 지키며 plain_korean_json에 담긴 한국어 텍스트를 검수하세요.
 """
     return prompt
 
 
-def review_korean_text(korean_text: str) -> Dict[str, Any]:
-    """한국어 텍스트 검수 래퍼"""
-    prompt = create_korean_review_prompt_for_text(korean_text)
-    raw = analyze_text_with_gemini(prompt)
-    cleaned = validate_and_clean_analysis(raw)
+def _review_korean_single_block(korean_text: str) -> Dict[str, Any]:
+    """
+    ✅ 2패스(Detector → Judge) 기반 한국어 단일 블록 검수
+    1차: Detector 프롬프트로 가능한 많은 오류 후보를 수집
+    2차: Judge 프롬프트로 의미 변경/스타일 제안/환각 등을 필터링
+    + 기존 규칙 기반 후처리(drop_lines_not_in_source 등)를 한 번 더 적용
+    """
 
+    # 1️⃣ 1차 패스: Detector
+    detector_prompt = create_korean_detector_prompt_for_text(korean_text)
+    detector_raw = analyze_text_with_gemini(detector_prompt)
+    detector_clean = validate_and_clean_analysis(detector_raw)
+
+    draft_report = detector_clean.get("translated_typo_report", "") or ""
+
+    # 2️⃣ 2차 패스: Judge
+    judge_prompt = create_korean_judge_prompt_for_text(korean_text, draft_report)
+    judge_raw = analyze_text_with_gemini(judge_prompt)
+    judge_clean = validate_and_clean_analysis(judge_raw)
+
+    # 2차 결과 기준으로 점수/리포트 사용
+    score = judge_clean.get("suspicion_score", 1)
+    try:
+        score = int(score)
+    except Exception:
+        score = 3
+
+    final_report = judge_clean.get("translated_typo_report", "") or ""
+
+    # 3️⃣ 규칙 기반 후처리 (기존 로직 그대로 유지)
     filtered = drop_lines_not_in_source(
         korean_text,
-        cleaned.get("translated_typo_report", "") or "",
+        final_report,
     )
     filtered = drop_false_korean_period_errors(filtered)
     filtered = ensure_final_punctuation_error(korean_text, filtered)
     filtered = ensure_sentence_end_punctuation(korean_text, filtered)
     filtered = dedup_korean_bullet_lines(filtered)
-    filtered = drop_lines_not_in_source(korean_text, filtered)  # ← 한 번 더 검증
+    filtered = drop_lines_not_in_source(korean_text, filtered)  # 한 번 더 검증
+
+    # 4️⃣ raw 번들 구성 (UI 호환 + 디버그용 정보 포함)
+    raw_bundle = {
+        "mode": "two_pass_single",
+        # UI가 그대로 쓸 수 있도록 상위 요약값도 넣어둠
+        "suspicion_score": score,
+        "translated_typo_report": final_report,
+        # 디버그용 상세 단계 정보
+        "detector_raw": detector_raw,
+        "detector_clean": detector_clean,
+        "judge_raw": judge_raw,
+        "judge_clean": judge_clean,
+        "initial_report_from_detector": draft_report,
+        "final_report_before_rule_postprocess": final_report,
+    }
+
+    return {
+        "score": score,
+        "content_typo_report": "",          # 한국어 탭에서는 사용 안 함
+        "translated_typo_report": filtered, # 규칙 기반 후처리까지 적용된 최종 리포트
+        "markdown_report": "",
+        "raw": raw_bundle,
+    }
+
+def review_korean_text(korean_text: str) -> Dict[str, Any]:
+    """
+    한국어 텍스트 검수 (chunk 지원 버전)
+
+    - 텍스트 길이가 짧으면: 기존 single block 로직 그대로 사용
+    - 텍스트가 길면: 여러 chunk로 나눈 뒤, 각 chunk를 개별 검수해서
+      리포트를 합쳐서 반환
+    """
+    # 1) chunking
+    chunks = split_korean_text_into_chunks(korean_text, max_len=MAX_KO_CHUNK_LEN)
+
+    # chunk가 1개면 기존 로직 그대로
+    if len(chunks) == 1:
+        return _review_korean_single_block(korean_text)
+
+    # 2) 여러 chunk를 순차 검수
+    merged_report_lines: List[str] = []
+    raw_list: List[Dict[str, Any]] = []
+    max_score = 1
+
+    for idx, chunk in enumerate(chunks, start=1):
+        res = _review_korean_single_block(chunk)
+
+        score = res.get("score", 1) or 1
+        max_score = max(max_score, score)
+
+        report = (res.get("translated_typo_report") or "").strip()
+        if report:
+            # 필요하면 chunk 번호를 구분용 헤더로 달아줄 수 있음
+            merged_report_lines.append(f"# [블록 {idx}]")
+            merged_report_lines.append(report)
+
+        raw_list.append({
+            "index": idx,
+            "text": chunk,
+            "raw": res.get("raw", {}),
+            "score": score,
+        })
+
+    merged_report = "\n".join(merged_report_lines).strip()
+
+    # 리포트가 하나도 없으면 score를 1로 통일
+    if not merged_report:
+        max_score = 1
+    elif max_score <= 1:
+        max_score = 3  # 뭔가 보고는 있는데 score가 1인 경우 기본 3으로 올리는 것도 가능
+
+    # raw에는 chunk별 정보 전체를 묶어서 넣어둔다
+    raw_bundle = {
+        "mode": "chunked",
+        "chunk_count": len(chunks),
+        "chunks": raw_list,
+        "suspicion_score": max_score,  # ✅ 추가
+    }
 
 
     return {
-        "score": cleaned.get("suspicion_score"),
-        "content_typo_report": cleaned.get("content_typo_report", ""),
-        "translated_typo_report": filtered,
-        "markdown_report": cleaned.get("markdown_report", ""),
-        "raw": raw,
+        "score": max_score,
+        "content_typo_report": "",              # 한국어 탭에서는 사용 안 하므로 비워둠
+        "translated_typo_report": merged_report,
+        "markdown_report": "",
+        "raw": raw_bundle,
     }
 
 
 # -------------------------------------------------
 # 1-B. 영어 단일 텍스트 검수 프롬프트 + 래퍼
 # -------------------------------------------------
+def create_english_detector_prompt_for_text(english_text: str) -> str:
+    """
+    1차 패스: Detector
+    - 가능한 많은 '잠재적 오류 후보'를 찾아내는 역할 (과검출 약간 허용)
+    """
+    safe_text = json.dumps(english_text, ensure_ascii=False)
+
+    prompt = f"""
+You are the first-pass **English text proofreader (Detector)**.
+
+Your job is to detect **as many potential objective errors as possible** in the given English text.
+You may slightly over-detect (allow some false positives), because a second-pass Judge will filter them.
+
+Your response MUST be a single JSON object with EXACTLY these keys:
+- "suspicion_score": integer 1~5
+- "content_typo_report": string
+- "translated_typo_report": ""   (keep empty, not used here)
+- "markdown_report": ""          (keep empty)
+
+Requirements for "content_typo_report":
+- It MUST be a newline-joined list of bullet lines.
+- Each line MUST follow this exact format (in Korean):
+
+  - '원문' → '수정안': 오류 설명
+
+- All explanations MUST be written in Korean.
+- '원문' MUST be an exact substring of the original English text (after decoding).
+
+The types of errors you should detect widely in this Detector pass:
+
+- English spelling mistakes
+- Split-word errors: "under stand" → "understand", "s imp le" → "simple"
+- AI context "Al" (A + small L) that should be "AI" (artificial intelligence)
+- Capitalization errors (sentence start, "i" instead of "I", proper nouns)
+- Clear duplicate words ("the the")
+- Obvious punctuation problems (missing final punctuation, ",." / ".." etc.)
+
+------------------------------------------------------------
+# Input: English text (JSON string)
+------------------------------------------------------------
+
+plain_english_json: {safe_text}
+
+- Decode plain_english_json to obtain plain_english.
+- In each bullet line "- '원문' → '수정안': 설명",
+  '원문' MUST be a substring of plain_english.
+
+Now, carefully detect as many *potential* objective errors as possible,
+and output them in "content_typo_report" following the format above.
+"""
+    return prompt
+
+
+def create_english_judge_prompt_for_text(english_text: str, draft_report: str) -> str:
+    """
+    2차 패스: Judge
+    - Detector가 만든 후보들 중에서 '의미를 바꾸지 않는 객관적 오류'만 남기고 필터링
+    """
+    safe_text = json.dumps(english_text, ensure_ascii=False)
+    safe_report = json.dumps(draft_report, ensure_ascii=False)
+
+    prompt = f"""
+You are the second-pass **English text proofreader (Judge)**.
+
+Your role:
+- Given the original English text and a candidate error list (draft_report),
+  you MUST **keep only the lines that are objective, safe corrections**,
+  and discard everything else.
+
+------------------------------------------------------------
+# Input 1: original English text (JSON string)
+------------------------------------------------------------
+plain_english_json: {safe_text}
+
+- Decode this JSON string to get plain_english.
+
+------------------------------------------------------------
+# Input 2: Detector's candidate report (JSON string)
+------------------------------------------------------------
+draft_report_json: {safe_report}
+
+- draft_report_json is a JSON string of the candidate report.
+- When decoded, it is a multi-line string.
+- Each line has the format:
+
+  - '원문' → '수정안': 설명
+
+------------------------------------------------------------
+# Filtering Criteria (ALL must be satisfied to keep a line)
+------------------------------------------------------------
+
+1. '원문' MUST be an exact substring of plain_english.
+2. '수정안' MUST represent an **objective, verifiable correction**, such as:
+   - spelling / split-word correction
+   - clear capitalization fix
+   - obvious punctuation fix (missing final ., ?, !, duplicated punctuation, etc.)
+3. You MUST REMOVE any line that:
+   - rewrites the sentence for style or naturalness,
+   - changes wording in a way that could change meaning,
+   - adds or removes content beyond a minimal error fix,
+   - is just a stylistic suggestion (better wording, tone, clarity, etc.).
+4. If '원문' does not appear in plain_english at all, that line MUST be removed.
+
+------------------------------------------------------------
+# Output
+------------------------------------------------------------
+
+Return EXACTLY ONE JSON object with keys:
+- "suspicion_score": integer 1~5 (based on remaining errors)
+- "content_typo_report":
+    a multi-line string containing ONLY the kept bullet lines
+    in the same format "- '원문' → '수정안': 설명"
+- "translated_typo_report": ""   (leave empty)
+- "markdown_report": ""          (leave empty)
+
+If no candidate lines satisfy all criteria, "content_typo_report" MUST be "".
+All explanations MUST still be written in Korean.
+"""
+    return prompt
+
+
+
 def create_english_review_prompt_for_text(english_text: str) -> str:
+    # 영어 원문도 JSON 문자열로 안전하게 감싸기
+    safe_text = json.dumps(english_text, ensure_ascii=False)
+
+    
     prompt = f"""
 You are a machine-like **English text proofreader**.
 Your ONLY job is to detect **objective, verifiable errors** in the following English text.
@@ -565,22 +1441,127 @@ Your response MUST be a valid JSON object with exactly these keys:
 All explanations in the *_report fields MUST be written in **Korean**.
 If nothing is wrong, each report field MUST be an empty string "".
 
-(중략 – 시트 영어 프롬프트와 동일 규칙)
+------------------------------------------------------------
+# 1. RULES FOR ENGLISH OBJECTIVE ERRORS
+------------------------------------------------------------
 
-plain_english: "{english_text}"
+## (A) Split-Word Errors (항상 오타로 취급 — 매우 중요)
+If an English word appears with an incorrect internal space,
+AND removing the space yields a valid English word,
+you MUST treat it as a spelling error.
+
+## (B) Normal English spelling mistakes (MUST detect)
+Any token similar to a valid English word (1–2 letters swapped/missing) MUST be flagged.
+
+## (C) AI 문맥에서 "Al" → "AI" (항상 잡기)
+If the surrounding sentence mentions:
+model / system / tool / chatbot / LLM / agent / dataset / training / inference
+then “Al” (A+소문자 l) MUST be interpreted as a typo for “AI”.
+
+## (D) Capitalization Errors
+- Sentence starting with lowercase
+- Pronoun “I” written as “i”
+- Proper nouns not capitalized (london → London)
+
+## (E) Duplicate / spacing errors
+- "the the"
+- "re turn" → "return"
+- "mod el" → "model"
+
+## (F) STRICT punctuation rule — avoid false positives
+You MUST NOT report a punctuation error if the text already ends with ANY of:
+- ".", "?", "!"
+- '."' / '!"' / '?"'
+- ".’" / "!’" / "?’"
+
+ONLY report a punctuation error if:
+- the sentence has NO ending punctuation at all, OR
+- a closing quotation mark is missing, OR
+- punctuation is clearly malformed (e.g. ",.", ".,", "..", "!!", "??" in a wrong place)
+
+------------------------------------------------------------
+# 2. OUTPUT FORMAT
+------------------------------------------------------------
+You MUST output EXACTLY ONE JSON object (no extra text, no markdown).
+
+Each error line example (in Korean):
+
+"- 'understaning' → 'understanding': 'understaning'은 철자 오타이며 'understanding'으로 수정해야 합니다."
+
+
+Below is the entire English text encoded as a JSON string.
+You MUST decode this JSON string to obtain the original text,
+and ONLY use that decoded text as the source for all 'original' spans.
+
+plain_english_json: {safe_text}
+
+- plain_english_json is a JSON-encoded string of the original English text.
+- You MUST decode it and use the decoded text (plain_english) as the ONLY source.
+- In "- '원문' → '수정안': ..." format, '원문' MUST be an exact substring of plain_english.
+
+Now, following all the above rules, carefully proofread the text in plain_english_json.
 """
     return prompt
 
 
 def review_english_text(english_text: str) -> Dict[str, Any]:
-    """영어 텍스트 검수 래퍼"""
-    prompt = create_english_review_prompt_for_text(english_text)
-    raw = analyze_text_with_gemini(prompt)
-    cleaned = validate_and_clean_analysis(raw, original_english_text=english_text)
+    """
+    영어 텍스트 검수 (2-pass: Detector -> Judge)
+    - 1차 Detector: 잠재적 오류 후보를 넓게 수집
+    - 2차 Judge: 의미 변경/스타일 제안/환각 제거
+    - + 규칙 기반 후처리 (drop_lines_not_in_source, ensure_english_final_punctuation)
+    """
+    # 1️⃣ 1차 패스: Detector
+    detector_prompt = create_english_detector_prompt_for_text(english_text)
+    detector_raw = analyze_text_with_gemini(detector_prompt)
+    detector_clean = validate_and_clean_analysis(
+        detector_raw,
+        original_english_text=english_text,
+    )
+
+    draft_report = detector_clean.get("content_typo_report", "") or ""
+
+    # 2️⃣ 2차 패스: Judge
+    judge_prompt = create_english_judge_prompt_for_text(english_text, draft_report)
+    judge_raw = analyze_text_with_gemini(judge_prompt)
+    judge_clean = validate_and_clean_analysis(
+        judge_raw,
+        original_english_text=english_text,
+    )
+
+    score = judge_clean.get("suspicion_score", 1)
+    try:
+        score = int(score)
+    except Exception:
+        score = 3
+    score = max(1, min(5, score))
+
+    final_report = judge_clean.get("content_typo_report", "") or ""
+
+    # 3️⃣ 규칙 기반 후처리 (영어용)
+    #   - LLM이 혹시 잘못 인용한 라인 제거
+    #   - 마지막 문장 종결부호 관련 요약 메시지 추가 (보수적으로)
+    filtered = drop_lines_not_in_source(english_text, final_report)
+    filtered = ensure_english_final_punctuation(english_text, filtered)
+    filtered = drop_lines_not_in_source(english_text, filtered)  # 한 번 더 검증
+
+    # 4️⃣ raw 번들 구성 (UI/디버그용)
+    raw_bundle = {
+        "mode": "two_pass_single_en",
+        "suspicion_score": score,
+        "content_typo_report": final_report,  # Judge 결과(룰 전)
+        "detector_raw": detector_raw,
+        "detector_clean": detector_clean,
+        "judge_raw": judge_raw,
+        "judge_clean": judge_clean,
+        "initial_report_from_detector": draft_report,
+        "final_report_before_rule_postprocess": final_report,
+    }
+
     return {
-        "score": cleaned.get("suspicion_score"),
-        "content_typo_report": cleaned.get("content_typo_report", ""),
-        "raw": raw,
+        "score": score,
+        "content_typo_report": filtered,  # 룰 후처리까지 끝난 최종 리포트
+        "raw": raw_bundle,
     }
 
 
@@ -678,14 +1659,11 @@ tab_ko, tab_en, tab_sheet, tab_about, tab_debug = st.tabs(
 )
 
 # --- 한국어 검수 탭 ---
+# --- 한국어 검수 탭 ---
 with tab_ko:
     st.subheader("한국어 텍스트 검수")
     default_ko = "이것은 테스트 문장 입니다, 그는.는 학교에 갔다,"
-    text_ko = st.text_area(
-        "한국어 텍스트 입력",
-        value=default_ko,
-        height=220,
-    )
+    text_ko = st.text_area("한국어 텍스트 입력", value=default_ko, height=220)
 
     if st.button("한국어 검수 실행", type="primary"):
         if not text_ko.strip():
@@ -700,50 +1678,153 @@ with tab_ko:
         score = result.get("score", 1)
         raw_json = result.get("raw", {}) or {}
 
-        final_json = {
-            "suspicion_score": result.get("score", 1),
-            "translated_typo_report": result.get("translated_typo_report", ""),
-        }
+        # 최종 리포트
+        final_report_ko = (result.get("translated_typo_report") or "").strip()
 
-        raw_view = {
-            "suspicion_score": raw_json.get("suspicion_score"),
-            "translated_typo_report": raw_json.get("translated_typo_report", ""),
+        # 1차 / 2차 / 최종 stage별 문자열 추출
+        stage_reports_ko = get_korean_stage_reports(raw_json, final_report_ko)
+
+        # 화면용 JSON (최종 기준)
+        final_json_display = {
+            "의심 점수": score,
+            "한국어 검수_report": stage_reports_ko["final"],
+        }
+        raw_json_display = {
+            "의심 점수": raw_json.get("suspicion_score"),
+            "한국어 검수_report": stage_reports_ko["judge"],  # 2차 Judge 결과
         }
 
         st.success("한국어 검수가 완료되었습니다!")
-        st.metric("의심 점수 (1~5)", f"{float(score):.2f}")
+        st.metric("의심 점수 (1~5) 1점 -> GOOD 5점 -> BAD", f"{float(score):.2f}")
 
         st.markdown("### 🔍 결과 비교 (Raw vs Final)")
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### ✅ Final JSON (후처리 적용)")
-            st.json(final_json, expanded=False)
+            st.json(final_json_display, expanded=False)
         with col2:
-            st.markdown("#### 🧪 Raw JSON (동일 필드만 발췌)")
-            st.json(raw_view, expanded=False)
+            st.markdown("#### 🧪 Raw JSON (2차 Judge 기준)")
+            st.json(raw_json_display, expanded=False)
 
-        st.markdown("#### 🔍 Raw vs Final 차이 요약")
-        diff_md = summarize_json_diff(raw_view, final_json)
-        st.markdown(diff_md)
+        # 1차/2차 JSON도 보고 싶으면 expander로
+        with st.expander("1차 Detector JSON (필요 시)", expanded=False):
+            st.json(raw_json.get("detector_clean", {}))
+        with st.expander("2차 Judge JSON (필요 시)", expanded=False):
+            st.json(raw_json.get("judge_clean", {}))
 
-        st.markdown("### 🛠 최종 수정 제안 사항")
-        suggestions = extract_korean_suggestions_from_raw({"translated_typo_report": final_json["translated_typo_report"]})
+        st.markdown("### 🛠 최종 수정 제안 사항 (최종 기준)")
+        suggestions = extract_korean_suggestions_from_raw(
+            {"translated_typo_report": stage_reports_ko["final"]}
+        )
         if not suggestions:
             st.info("보고할 수정 사항이 없습니다.")
         else:
             for s in suggestions:
                 st.markdown(s)
 
+        # ---------------- 하이라이트 ----------------
+        st.markdown("### 📍 오류 위치 및 하이라이트")
+
+        stage_choice_ko = st.radio(
+            "하이라이트 기준 선택",
+            ["최종(Final)", "2차 Judge", "1차 Detector"],
+            horizontal=True,
+            key="ko_highlight_mode",
+        )
+
+        if stage_choice_ko == "최종(Final)":
+            report_for_highlight = stage_reports_ko["final"]
+            mode_label = "최종(Final) 기준"
+        elif stage_choice_ko == "2차 Judge":
+            report_for_highlight = stage_reports_ko["judge"]
+            mode_label = "2차 Judge 기준"
+        else:
+            report_for_highlight = stage_reports_ko["detector"]
+            mode_label = "1차 Detector 기준"
+
+        spans_ko = parse_korean_report_with_positions(text_ko, report_for_highlight)
+
+        st.markdown(f"#### 🔦 {mode_label} 하이라이트")
+
+        if not spans_ko:
+            st.info(f"{mode_label}으로 하이라이트할 항목이 없습니다.")
+        else:
+            for span in spans_ko:
+                if span["line"] is None:
+                    st.markdown(
+                        f"- `{span['original']}` → `{span['fixed']}`: {span['message']}"
+                    )
+                else:
+                    st.markdown(
+                        f"- L{span['line']}, C{span['col']} — "
+                        f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
+                    )
+
+            highlighted_ko = highlight_text_with_spans(text_ko, spans_ko)
+            st.markdown(
+                f"<pre style='white-space: pre-wrap;'>{highlighted_ko}</pre>",
+                unsafe_allow_html=True,
+            )
+
+        # 문장부호 전용 하이라이트 뷰 (오류 여부와 무관하게 문장부호 색상만 표시)
+        st.markdown("#### ✨ 문장부호만 보기")
+        default_punct_keys = list(PUNCT_GROUPS.keys())
+        selected_punct_keys_ko = st.multiselect(
+            "하이라이트할 문장부호 선택",
+            options=default_punct_keys,
+            default=default_punct_keys,
+            key="ko_punct_filter",
+            help="선택한 부호만 색상 표시",
+        )
+
+        punctuation_only_ko = highlight_selected_punctuation(text_ko, selected_punct_keys_ko)
+        punct_counts_ko = Counter(ch for ch in text_ko if ch in PUNCT_COLOR_MAP)
+        badge_order_ko = [
+            (".", "종결부호"),
+            ("?", "물음표"),
+            ("!", "느낌표"),
+            (",", "쉼표"),
+            ('"', "쌍따옴표"),
+            ("'", "작은따옴표"),
+        ]
+        badges_ko = []
+        for ch, label in badge_order_ko:
+            count = punct_counts_ko.get(ch, 0)
+            color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
+            badges_ko.append(
+                f"<span style='background-color: {color}; padding: 2px 6px; border-radius: 4px; margin-right: 6px; display: inline-block;'>{label}: {count}</span>"
+            )
+
+        st.markdown(
+            f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_ko)}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_ko}</pre>",
+            unsafe_allow_html=True,
+        )
+
+        st.caption("※ 동일한 구절이 여러 번 등장하는 경우, 첫 번째 위치가 하이라이트될 수 있습니다.")
+        st.markdown("""
+            <small>
+            <b>문장부호 색상 안내:</b><br>
+            <span style='background-color: #fff3cd; padding: 0 3px;'>.</span> 종결부호 (., etc) &nbsp;
+            <span style='background-color: #f8d7da; padding: 0 3px;'>?</span> 물음표 &nbsp;
+            <span style='background-color: #f5c6cb; padding: 0 3px;'>!</span> 느낌표 &nbsp;
+            <span style='background-color: #d1ecf1; padding: 0 3px;'>,</span> 쉼표 &nbsp;
+            <span style='background-color: #e0f7e9; padding: 0 3px;'>&ldquo;</span> 쌍따옴표 &nbsp;
+            <span style='background-color: #fce9d9; padding: 0 3px;'>&lsquo;</span> 작은따옴표 &nbsp;
+            <span style='background-color: #d6d8d9; padding: 0 3px;'>; :</span> 기타 문장부호
+            </small>
+            """, unsafe_allow_html=True)
+
+
 
 # --- 영어 검수 탭 ---
 with tab_en:
     st.subheader("영어 텍스트 검수")
     default_en = 'This is a simple understaning of the Al model.'
-    text_en = st.text_area(
-        "English text input",
-        value=default_en,
-        height=220,
-    )
+    text_en = st.text_area("English text input", value=default_en, height=220)
 
     if st.button("영어 검수 실행", type="primary"):
         if not text_en.strip():
@@ -758,18 +1839,21 @@ with tab_en:
         score = result.get("score", 1)
         raw_json = result.get("raw", {}) or {}
 
-        final_json = {
-            "suspicion_score": result.get("score", 1),
-            "content_typo_report": result.get("content_typo_report", ""),
-        }
+        # 최종 리포트
+        final_report_en = (result.get("content_typo_report") or "").strip()
+        stage_reports_en = get_english_stage_reports(raw_json, final_report_en)
 
+        final_json = {
+            "의심 점수": score,
+            "영문 검수_report": stage_reports_en["final"],
+        }
         raw_view = {
-            "suspicion_score": raw_json.get("suspicion_score"),
-            "content_typo_report": raw_json.get("content_typo_report", ""),
+            "의심 점수": raw_json.get("suspicion_score"),
+            "영문 검수_report": stage_reports_en["judge"],  # 2차 Judge
         }
 
         st.success("영어 검수가 완료되었습니다!")
-        st.metric("Suspicion score (1~5)", f"{float(score):.2f}")
+        st.metric("의심 점수 (1~5) 1점 -> GOOD 5점 -> BAD", f"{float(score):.2f}")
 
         st.markdown("### 🔍 결과 비교 (Raw vs Final)")
         col1, col2 = st.columns(2)
@@ -777,20 +1861,125 @@ with tab_en:
             st.markdown("#### ✅ Final JSON (후처리 적용)")
             st.json(final_json, expanded=False)
         with col2:
-            st.markdown("#### 🧪 Raw JSON (동일 필드만 발췌)")
+            st.markdown("#### 🧪 Raw JSON (2차 Judge 기준)")
             st.json(raw_view, expanded=False)
 
         st.markdown("#### 🔍 Raw vs Final 차이 요약")
-        diff_md = summarize_json_diff(raw_view, final_json)
-        st.markdown(diff_md)
+        diff_md_en = summarize_json_diff(raw_view, final_json)
+        st.markdown(diff_md_en)
 
-        st.markdown("### 🛠 최종 수정 제안 사항 (영어 원문 기준)")
-        suggestions = extract_english_suggestions_from_raw(raw_json)
-        if not suggestions:
+        st.markdown("### 🛠 최종 수정 제안 사항 (최종 기준)")
+        suggestions_en = extract_english_suggestions_from_raw(
+            {"content_typo_report": stage_reports_en["final"]}
+        )
+        if not suggestions_en:
             st.info("보고할 수정 사항이 없습니다.")
         else:
-            for s in suggestions:
+            for s in suggestions_en:
                 st.markdown(s)
+
+        with st.expander("1차 Detector JSON (필요 시)", expanded=False):
+            st.json(raw_json.get("detector_clean", {}))
+        with st.expander("2차 Judge JSON (필요 시)", expanded=False):
+            st.json(raw_json.get("judge_clean", {}))
+
+        st.markdown("### 📍 오류 위치 및 하이라이트")
+
+        view_mode_en = st.radio(
+            "하이라이트 기준 선택",
+            ["최종(Final)", "2차 Judge", "1차 Detector"],
+            horizontal=True,
+            key="en_highlight_mode",
+        )
+
+        if view_mode_en == "최종(Final)":
+            report_for_highlight = stage_reports_en["final"]
+            mode_label_en = "최종(Final) 기준"
+        elif view_mode_en == "2차 Judge":
+            report_for_highlight = stage_reports_en["judge"]
+            mode_label_en = "2차 Judge 기준"
+        else:
+            report_for_highlight = stage_reports_en["detector"]
+            mode_label_en = "1차 Detector 기준"
+
+        spans_en = parse_english_report_with_positions(text_en, report_for_highlight)
+
+        st.markdown(f"#### 🔦 {mode_label_en} 하이라이트")
+
+        if not spans_en:
+            st.info(f"{mode_label_en}으로 하이라이트할 항목이 없습니다.")
+        else:
+            for span in spans_en:
+                if span["line"] is None:
+                    st.markdown(
+                        f"- `{span['original']}` → `{span['fixed']}`: {span['message']}"
+                    )
+                else:
+                    st.markdown(
+                        f"- L{span['line']}, C{span['col']} — "
+                        f"`{span['original']}` → `{span['fixed']}`: {span['message']}"
+                    )
+
+            highlighted_en = highlight_text_with_spans(text_en, spans_en)
+            st.markdown(
+                f"<pre style='white-space: pre-wrap;'>{highlighted_en}</pre>",
+                unsafe_allow_html=True,
+            )
+
+        # 문장부호 전용 하이라이트 뷰
+        st.markdown("#### ✨ 문장부호만 보기")
+        default_punct_keys = list(PUNCT_GROUPS.keys())
+        selected_punct_keys_en = st.multiselect(
+            "하이라이트할 문장부호 선택",
+            options=default_punct_keys,
+            default=default_punct_keys,
+            key="en_punct_filter",
+            help="선택한 부호만 색상 표시",
+        )
+
+        punctuation_only_en = highlight_selected_punctuation(text_en, selected_punct_keys_en)
+        punct_counts_en = Counter(ch for ch in text_en if ch in PUNCT_COLOR_MAP)
+        badge_order_en = [
+            (".", "종결부호"),
+            ("?", "물음표"),
+            ("!", "느낌표"),
+            (",", "쉼표"),
+            ('"', "쌍따옴표"),
+            ("'", "작은따옴표"),
+        ]
+        badges_en = []
+        for ch, label in badge_order_en:
+            count = punct_counts_en.get(ch, 0)
+            color = PUNCT_COLOR_MAP.get(ch, "#e2e3e5")
+            badges_en.append(
+                f"<span style='background-color: {color}; padding: 2px 6px; border-radius: 4px; margin-right: 6px; display: inline-block;'>{label}: {count}</span>"
+            )
+
+        st.markdown(
+            f"<div style='border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; background: #f8f9fa; margin-bottom: 6px;'>{''.join(badges_en)}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<pre style='white-space: pre-wrap; background: #fefefe; border: 1px solid #e9ecef; border-radius: 6px; padding: 10px;'>{punctuation_only_en}</pre>",
+            unsafe_allow_html=True,
+        )
+
+        st.caption("※ 동일한 구절이 여러 번 등장하는 경우, 첫 번째 위치가 하이라이트될 수 있습니다.")
+        st.markdown("""
+             <small>
+            <b>문장부호 색상 안내:</b><br>
+            <span style='background-color: #fff3cd; padding: 0 3px;'>.</span> 종결부호 (., etc) &nbsp;
+            <span style='background-color: #f8d7da; padding: 0 3px;'>?</span> 물음표 &nbsp;
+            <span style='background-color: #f5c6cb; padding: 0 3px;'>!</span> 느낌표 &nbsp;
+            <span style='background-color: #d1ecf1; padding: 0 3px;'>,</span> 쉼표 &nbsp;
+            <span style='background-color: #e0f7e9; padding: 0 3px;'>&ldquo;</span> 쌍따옴표 &nbsp;
+            <span style='background-color: #fce9d9; padding: 0 3px;'>&lsquo;</span> 작은따옴표 &nbsp;
+            <span style='background-color: #d6d8d9; padding: 0 3px;'>; :</span> 기타 문장부호
+            </small>
+            """, unsafe_allow_html=True)
+
+
+
 
 
 # --- 시트 검수 탭 ---
