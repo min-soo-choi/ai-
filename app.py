@@ -153,6 +153,43 @@ PDF_RESTORE_SYSTEM_PROMPT = """
 
 """
 
+def normalize_inline_answer_marker(text: str) -> str:
+    """
+    문항 번호 + 정답 기호가 문장 안에 섞여 있는 경우를 정규화한다.
+
+    예:
+    "1) ④ ( ) ( ) 출제 유형 ... [정답 해설] ..."
+    →
+    "1) 정답: ④\n[정답 해설] ..."
+    """
+    if not text:
+        return text
+
+    text = text.replace("\r\n", "\n")
+
+    # ①②③④⑤⑥⑦⑧⑨⑩
+    circled_nums = "①②③④⑤⑥⑦⑧⑨⑩"
+
+    # 문항 번호 + 정답 기호 패턴
+    pattern = re.compile(
+        rf"""
+        (\b\d+\))            # 1) 같은 문항 번호
+        \s*
+        ([{circled_nums}])   # ④ 같은 정답 기호
+        .*?
+        (?=\[정답\s*해설\])  # [정답 해설] 직전까지만 먹음
+        """,
+        re.VERBOSE | re.DOTALL,
+    )
+
+    def repl(m):
+        qno = m.group(1)
+        ans = m.group(2)
+        return f"{qno} 정답: {ans}\n"
+
+    return pattern.sub(repl, text)
+
+
 def tighten_between_answer_blocks(text: str) -> str:
     """
     [정답 해설] 블록과 [오답 해설] 헤더 사이에 들어간
@@ -212,15 +249,16 @@ def restore_pdf_text(raw_text: str) -> str:
     m = re.match(r"^```[^\n]*\n(.*)\n```$", stripped, re.S)
     if m:
         inner = m.group(1)
+        inner = normalize_inline_answer_marker(inner)
         inner = tighten_between_answer_blocks(inner)
         stripped = f"```text\n{inner}\n```"
     else:
         # 코드블록이 아니라면 우리가 감싸주면서 정리
         inner = tighten_between_answer_blocks(stripped)
+        inner = normalize_inline_answer_marker(inner)
         stripped = f"```text\n{inner}\n```"
 
     return stripped
-import re
 
 def remove_first_line_in_code_block(block: str) -> str:
     """
@@ -679,7 +717,7 @@ def drop_lines_not_in_source(source_text: str, report: str) -> str:
             cleaned.append(s)
             continue
 
-        original = m.group(1)
+        original = m.group(2)
         if original in source_text:
             cleaned.append(s)
         else:
@@ -716,8 +754,8 @@ def clean_self_equal_corrections(report: str) -> str:
             cleaned_lines.append(line_stripped)
             continue
 
-        orig = m.group(1).strip()
-        fixed = m.group(2).strip()
+        orig = m.group(2).strip()
+        fixed = m.group(4).strip()
 
         if orig == fixed:
             continue
@@ -734,10 +772,7 @@ def drop_false_period_errors(english_text: str, report: str) -> str:
     (거짓 양성 줄이기용)
     """
     
-    pattern = re.compile(
-    r"""^-\s*(['"])(.+?)\1\s*(?:→|->)\s*(['"])(.+?)\3\s*:""",
-    re.UNICODE,
-)
+    
 
     if not report:
         return ""
@@ -969,10 +1004,6 @@ def dedup_korean_bullet_lines(report: str) -> str:
     - '불필요한 마침표'류에서 원문이 부분 문자열 관계이면 더 긴 쪽만 유지
     """
     
-    pattern = re.compile(
-    r"""^-\s*(['"])(.+?)\1\s*(?:→|->)\s*(['"])(.+?)\3\s*:""",
-    re.UNICODE,
-    )
 
     if not report:
         return ""
