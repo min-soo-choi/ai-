@@ -6,12 +6,36 @@ import re
 import html
 from collections import Counter
 from typing import Dict, Any, List
+from datetime import datetime, timezone
+import uuid
+import traceback
+
+import gspread
+from google.oauth2.service_account import Credentials
+
 
 import streamlit as st
 import google.generativeai as genai
 
-from sheet_review import run_sheet_review
+# 로그 설정 (없으면 비활성)
+LOG_SHEET_ID = st.secrets.get("LOG_SHEET_ID")
+LOG_WORKSHEET_NAME = st.secrets.get("LOG_WORKSHEET", "usage_log")
+LOGGING_ENABLED = bool(LOG_SHEET_ID)
 
+from sheet_review import run_sheet_review
+LOG_HEADERS = [
+    "timestamp_utc",
+    "session_id",
+    "feature",
+    "model",
+    "status",
+    "latency_ms",
+    "prompt_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cost_usd",
+    "error",
+]
 
 # --------------------------
 # 0. Gemini 설정 (키는 secrets에서만 읽기)
@@ -23,6 +47,183 @@ if not API_KEY:
 
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash-001")
+
+MODEL_NAME = "gemini-2.0-flash-001"
+
+def log_event(row: dict):
+    """
+    Gemini 호출 1회에 대한 로그를 Google Sheets에 기록
+    """
+    ws = _get_log_worksheet()
+    if ws is None:
+        return  # 로깅 비활성 or 시트 접근 실패 시 조용히 무시
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    values = [
+        now_utc,                              # timestamp_utc
+        st.session_state.get("session_id"),   # session_id
+        row.get("feature", ""),
+        row.get("model", ""),
+        row.get("status", ""),
+        row.get("latency_ms", 0),
+        row.get("prompt_tokens", 0),
+        row.get("output_tokens", 0),
+        row.get("total_tokens", 0),
+        row.get("cost_usd", 0.0),
+        row.get("error", ""),
+    ]
+
+    ws.append_row(values, value_input_option="RAW")
+
+def gemini_call(feature: str, prompt: str, generation_config: dict):
+    t0 = time.time()
+    try:
+        response = model.generate_content(prompt, generation_config=generation_config)
+        latency_ms = int((time.time() - t0) * 1000)
+
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+        output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+        total_tokens = int(getattr(usage, "total_token_count", prompt_tokens + output_tokens) or (prompt_tokens + output_tokens))
+
+        cost_usd = calc_gemini_flash_cost_usd(prompt_tokens, output_tokens)
+
+        log_event({
+            "feature": feature,
+            "model": "gemini-2.0-flash-001",
+            "status": "ok",
+            "latency_ms": latency_ms,
+            "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cost_usd": cost_usd,
+            "error": "",
+        })
+
+        return response
+
+    except Exception as e:
+        latency_ms = int((time.time() - t0) * 1000)
+        log_event({
+            "feature": feature,
+            "model": "gemini-2.0-flash-001",
+            "status": "error",
+            "latency_ms": latency_ms,
+            "prompt_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "error": str(e),
+        })
+        raise
+
+
+def _get_session_id() -> str:
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = str(uuid.uuid4())
+    return st.session_state["session_id"]
+
+def calc_gemini_flash_cost_usd(prompt_tokens: int, output_tokens: int) -> float:
+    # Gemini 2.0 Flash (Standard) - text pricing
+    in_cost_per_1m = 0.10
+    out_cost_per_1m = 0.40
+    return (prompt_tokens / 1_000_000) * in_cost_per_1m + (output_tokens / 1_000_000) * out_cost_per_1m
+
+
+@st.cache_resource
+def _get_log_worksheet():
+    if not LOGGING_ENABLED:
+        return None
+
+    try:
+        sa_info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])  # ✅ 핵심
+        creds = Credentials.from_service_account_info(
+            sa_info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(LOG_SHEET_ID)
+
+        # 1) 워크시트 가져오기 (없으면 생성)
+        try:
+            ws = sh.worksheet(LOG_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=LOG_WORKSHEET_NAME, rows=2000, cols=20)
+
+        # 2) 시트가 완전 비어있으면 헤더 생성
+        #    (이미 뭔가 있으면 건드리지 않음)
+        if len(ws.get_all_values()) == 0:
+            ws.append_row(LOG_HEADERS)
+
+        return ws
+
+    except Exception as e:
+        # 최소한 원인 추적 가능하게 로그 남기기
+        st.error(f"[LOG] worksheet init failed: {e}")
+        st.code(traceback.format_exc())
+        return None
+def _extract_token_usage(response) -> dict:
+    """
+    SDK/버전별로 usage 메타가 없을 수도 있으니 최대한 방어적으로 추출.
+    (일반적으로 usage_metadata에 prompt/candidates/total token count가 들어옵니다.) :contentReference[oaicite:1]{index=1}
+    """
+    usage = {"prompt_tokens": None, "output_tokens": None, "total_tokens": None}
+
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        return usage
+
+    # 객체/딕트 모두 대응
+    getter = (lambda k: um.get(k)) if isinstance(um, dict) else (lambda k: getattr(um, k, None))
+
+    usage["prompt_tokens"] = getter("prompt_token_count")
+    usage["output_tokens"] = getter("candidates_token_count")
+    usage["total_tokens"]  = getter("total_token_count")
+    return usage
+
+def log_gemini_call(feature: str, response=None, latency_ms: int | None = None, ok: bool = True, error_msg: str = ""):
+    if not LOGGING_ENABLED:
+        return
+    try:
+        ws = _get_log_worksheet()
+        if ws is None:
+            return
+        ts = datetime.now(timezone.utc).isoformat()
+        sid = _get_session_id()
+
+        usage = _extract_token_usage(response) if response is not None else {}
+        row = [
+            ts,                 # timestamp (UTC)
+            sid,                # session_id (익명)
+            feature,            # 예: ko_detector / en_judge / pdf_restore ...
+            MODEL_NAME,
+            "OK" if ok else "ERR",
+            latency_ms,
+            usage.get("prompt_tokens"),
+            usage.get("output_tokens"),
+            usage.get("total_tokens"),
+            (error_msg or "")[:500],
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        # 로그 실패가 앱 동작을 막으면 안 되니 조용히 넘김 (원하면 st.warning으로 바꿔도 됨)
+        print(f"[LOGGING FAILED] {e}")
+
+def generate_content_logged(feature: str, prompt: str, generation_config: dict):
+    t0 = time.time()
+    try:
+        resp = model.generate_content(prompt, generation_config=generation_config)
+        latency_ms = int((time.time() - t0) * 1000)
+        log_gemini_call(feature, response=resp, latency_ms=latency_ms, ok=True)
+        return resp
+    except Exception as e:
+        latency_ms = int((time.time() - t0) * 1000)
+        log_gemini_call(feature, response=None, latency_ms=latency_ms, ok=False, error_msg=str(e))
+        raise
 
 
 # -------------------------------------------------
@@ -237,10 +438,7 @@ def restore_pdf_text(raw_text: str) -> str:
 
     # 이 기능은 JSON이 아니라 순수 텍스트를 기대하므로
     # response_mime_type은 지정하지 않는다.
-    response = model.generate_content(
-        prompt,
-        generation_config={"temperature": 0.0},
-    )
+    response = gemini_call(feature="ui.pdf_restore.single", prompt=prompt, generation_config={"temperature": 0.0})
     text = getattr(response, "text", "") or ""
     stripped = text.strip()
 
@@ -634,7 +832,8 @@ def highlight_selected_punctuation(source_text: str, selected_keys: list[str]) -
 
 
 
-def analyze_text_with_gemini(prompt: str, max_retries: int = 5) -> dict:
+def analyze_text_with_gemini(prompt: str, feature: str, max_retries: int = 5) -> dict:
+
     """
     단일 텍스트 검사용 Gemini 호출.
     항상 dict를 리턴하도록 방어 로직을 넣음.
@@ -643,14 +842,14 @@ def analyze_text_with_gemini(prompt: str, max_retries: int = 5) -> dict:
 
     for attempt in range(max_retries):
         try:
-            generation_config = {
+            response = gemini_call(
+            feature=feature,
+            prompt=prompt,
+            generation_config={
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
-            }
-            response = model.generate_content(
-                prompt,
-                generation_config=generation_config,
-            )
+            },
+)
 
             raw = getattr(response, "text", None)
             if raw is None or not str(raw).strip():
@@ -1434,24 +1633,26 @@ plain_korean_json: {safe_text}
     return prompt
 
 
-def _review_korean_single_block(korean_text: str) -> Dict[str, Any]:
-    """
-    ✅ 2패스(Detector → Judge) 기반 한국어 단일 블록 검수
-    1차: Detector 프롬프트로 가능한 많은 오류 후보를 수집
-    2차: Judge 프롬프트로 의미 변경/스타일 제안/환각 등을 필터링
-    + 기존 규칙 기반 후처리(drop_lines_not_in_source 등)를 한 번 더 적용
-    """
+def _review_korean_single_block(korean_text: str, block_id: int | None = None) -> Dict[str, Any]:
+    det_feature = f"ui.ko_proof.detector.block_{block_id}" if block_id else "ui.ko_proof.detector.single"
+    jud_feature = f"ui.ko_proof.judge.block_{block_id}"    if block_id else "ui.ko_proof.judge.single"
 
     # 1️⃣ 1차 패스: Detector
     detector_prompt = create_korean_detector_prompt_for_text(korean_text)
-    detector_raw = analyze_text_with_gemini(detector_prompt)
+    detector_raw = analyze_text_with_gemini(
+        detector_prompt,
+        feature=det_feature,
+    )
     detector_clean = validate_and_clean_analysis(detector_raw)
 
     draft_report = detector_clean.get("translated_typo_report", "") or ""
 
     # 2️⃣ 2차 패스: Judge
     judge_prompt = create_korean_judge_prompt_for_text(korean_text, draft_report)
-    judge_raw = analyze_text_with_gemini(judge_prompt)
+    judge_raw = analyze_text_with_gemini(
+        judge_prompt,
+        feature=jud_feature,
+    )
     judge_clean = validate_and_clean_analysis(judge_raw)
 
     # 2차 결과 기준으로 점수/리포트 사용
@@ -1519,7 +1720,8 @@ def review_korean_text(korean_text: str) -> Dict[str, Any]:
     max_score = 1
 
     for idx, chunk in enumerate(chunks, start=1):
-        res = _review_korean_single_block(chunk)
+        res = _review_korean_single_block(chunk, block_id=idx)
+
 
         score = res.get("score", 1) or 1
         max_score = max(max_score, score)
@@ -1779,7 +1981,7 @@ def review_english_text(english_text: str) -> Dict[str, Any]:
     """
     # 1️⃣ 1차 패스: Detector
     detector_prompt = create_english_detector_prompt_for_text(english_text)
-    detector_raw = analyze_text_with_gemini(detector_prompt)
+    detector_raw = analyze_text_with_gemini(detector_prompt, feature="ui.en_proof.detector.single")
     detector_clean = validate_and_clean_analysis(
         detector_raw,
         original_english_text=english_text,
@@ -1789,7 +1991,7 @@ def review_english_text(english_text: str) -> Dict[str, Any]:
 
     # 2️⃣ 2차 패스: Judge
     judge_prompt = create_english_judge_prompt_for_text(english_text, draft_report)
-    judge_raw = analyze_text_with_gemini(judge_prompt)
+    judge_raw    = analyze_text_with_gemini(judge_prompt,    feature="ui.en_proof.judge.single")
     judge_clean = validate_and_clean_analysis(
         judge_raw,
         original_english_text=english_text,
