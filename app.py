@@ -145,8 +145,36 @@ PDF_RESTORE_SYSTEM_PROMPT = """
 - 코드 블록 밖에는 어떤 설명도 출력하지 말고,
   오직 정리된 텍스트만 코드 블록 안에 넣어라.
 - 코드 블록 언어 표시는 text로 사용해도 되고, 생략해도 된다.
+
+6) 블록 간 공백 규칙
+- [정답 해설] 블록과 그 다음 블록 사이에는 빈 줄을 정확히 1줄만 둔다.
+- [오답 해설] 블록과 원기호(①, ②, ㉠…) 목록 사이에도 빈 줄을 정확히 1줄만 둔다.
+- 블록 내부에서는 불필요한 연속 빈 줄을 제거하고 논리적으로 필요한 경우에만 단일 줄바꿈을 유지한다.
+
 """
 
+def tighten_between_answer_blocks(text: str) -> str:
+    """
+    [정답 해설] 블록과 [오답 해설] 헤더 사이에 들어간
+    '빈 줄 1줄(또는 여러 줄)'을 제거해서 바로 붙인다.
+
+    예)
+    [정답 해설]
+    해설 내용
+
+    [오답 해설]
+
+    → [정답 해설]
+      해설 내용
+      [오답 해설]
+    """
+    if not text:
+        return text
+
+    # '\n(빈 줄들)\n[오답 해설]' 패턴을 '\n[오답 해설]'로 바꿈
+    # \s* 때문에 공백/탭이 섞여 있어도 같이 제거됨
+    text = re.sub(r"\n\s*\n(\[오답 해설\])", r"\n\1", text)
+    return text
 
 def restore_pdf_text(raw_text: str) -> str:
     """
@@ -174,18 +202,67 @@ def restore_pdf_text(raw_text: str) -> str:
     # response_mime_type은 지정하지 않는다.
     response = model.generate_content(
         prompt,
-        generation_config={
-            "temperature": 0.0,
-        },
+        generation_config={"temperature": 0.0},
     )
     text = getattr(response, "text", "") or ""
-
-    # 혹시 모델이 코드블록을 안 지켰을 경우를 대비해 최소한의 래핑
     stripped = text.strip()
-    if not stripped.startswith("```"):
-        stripped = f"```text\n{stripped}\n```"
+
+    # 코드블록 안/밖을 처리하기 전에, 내용 부분 먼저 정리
+    # 1) 코드블록이면 안쪽만 꺼내서 가공
+    m = re.match(r"^```[^\n]*\n(.*)\n```$", stripped, re.S)
+    if m:
+        inner = m.group(1)
+        inner = tighten_between_answer_blocks(inner)
+        stripped = f"```text\n{inner}\n```"
+    else:
+        # 코드블록이 아니라면 우리가 감싸주면서 정리
+        inner = tighten_between_answer_blocks(stripped)
+        stripped = f"```text\n{inner}\n```"
 
     return stripped
+import re
+
+def remove_first_line_in_code_block(block: str) -> str:
+    """
+    ```text
+    AAA
+    BBB
+    CCC
+    ```
+    이런 문자열에서 AAA 줄만 지우고
+
+    ```text
+    BBB
+    CCC
+    ```
+    로 돌려준다.
+    코드블록이 아니어도 그냥 첫 줄만 제거해서 반환.
+    """
+    if not block:
+        return block
+
+    stripped = block.strip()
+
+    # 1) 코드블록 형태인지 먼저 확인
+    m = re.match(r"^```[^\n]*\n(.*)\n```$", stripped, re.S)
+    if m:
+        inner = m.group(1)
+    else:
+        inner = stripped
+
+    lines = inner.splitlines()
+    if not lines:
+        new_inner = ""
+    else:
+        # 첫 줄 제거
+        new_inner = "\n".join(lines[1:])
+
+    # 코드블록이었던 경우 다시 감싸서 반환
+    if m:
+        return f"```text\n{new_inner}\n```"
+    else:
+        return new_inner
+
 
 
 
@@ -2167,34 +2244,46 @@ with tab_en:
 
 
 # --- PDF 텍스트 정리 탭 ---
+# --- PDF 텍스트 정리 탭 ---
 with tab_pdf:
     st.subheader("📄 PDF에서 복사한 텍스트 정리")
-    st.caption("PDF 시험지/해설에서 복사한 텍스트를 붙여넣으면, 헤더/줄바꿈/번호/오타를 정리해 줍니다.")
+    st.caption("PDF에서 복사한 텍스트를 붙여넣고 정리 + 첫 줄 삭제까지 할 수 있습니다.")
 
-    col1, col2 = st.columns([2, 1])
+    pdf_raw_text = st.text_area(
+        "PDF에서 복사한 원본 텍스트",
+        height=300,
+        key="pdf_input_text",
+    )
 
-    with col1:
-        pdf_raw_text = st.text_area(
-            "PDF에서 복사한 원본 텍스트를 여기에 붙여넣으세요",
-            height=350,
-            placeholder="예) 해설 PDF에서 Ctrl+C / Ctrl+V 한 텍스트...",
-        )
-
-    with col2:
-        st.markdown("#### 옵션")
+    colA, colB = st.columns([1, 1])
+    with colA:
         auto_trim_pdf = st.checkbox("앞뒤 공백 자동 제거", value=True, key="pdf_trim")
+
+    with colB:
         run_pdf = st.button("텍스트 정리 실행", type="primary", key="pdf_run")
 
     if run_pdf:
         if not pdf_raw_text.strip():
-            st.warning("먼저 PDF에서 복사한 텍스트를 입력해주세요.")
+            st.warning("먼저 텍스트를 입력해주세요.")
         else:
             text_to_send = pdf_raw_text.strip() if auto_trim_pdf else pdf_raw_text
             with st.spinner("Gemini가 텍스트를 정리하는 중입니다..."):
                 cleaned_block = restore_pdf_text(text_to_send)
+            # ✅ 정리된 결과를 세션에 저장
+            st.session_state["pdf_cleaned"] = cleaned_block
 
-            st.markdown("#### ✅ 정리된 텍스트 (복사해서 사용하세요)")
-            st.markdown(cleaned_block)
+    cleaned_block = st.session_state.get("pdf_cleaned")
+
+    if cleaned_block:
+        st.markdown("#### ✅ 정리된 텍스트")
+
+        # 🔘 여기서 '맨 위 줄 지우기' 버튼
+        if st.button("맨 위 줄만 지우기", key="pdf_delete_first_line"):
+            st.session_state["pdf_cleaned"] = remove_first_line_in_code_block(cleaned_block)
+            st.rerun()
+
+        # 최신 상태 보여주기
+        st.markdown(st.session_state["pdf_cleaned"])
 
 
 

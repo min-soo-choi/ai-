@@ -453,7 +453,7 @@ def drop_language_switch(report: str) -> str:
 
 def drop_large_edits(report: str) -> str:
     """
-    수정안이 원문보다 4글자 이상 더 길거나 짧으면
+    수정안이 원문보다 3글자 이상 더 길거나 짧으면
     '의미 변경' 가능성이 높으므로 drop.
     (공백 제거 후 길이 기준)
     """
@@ -474,7 +474,7 @@ def drop_large_edits(report: str) -> str:
         orig = m.group(1).replace(" ", "")
         fix = m.group(2).replace(" ", "")
 
-        if abs(len(fix) - len(orig)) >= 4:
+        if abs(len(fix) - len(orig)) >= 3:
             continue
 
         cleaned.append(s)
@@ -644,6 +644,11 @@ Your ONLY job is to detect **objective, verifiable errors** in the following Eng
 You MUST NOT suggest stylistic changes, paraphrasing, natural-sounding alternatives,
 tone changes, or meaning changes.
 
+🚫 DO NOT change meaning/order/length
+- Do NOT rewrite, summarize, or rephrase any sentence.
+- Do NOT add/remove/replace tokens unless it's the minimal fix for a spelling/spacing/punctuation error.
+- Keep numbers, symbols, and structure exactly as in the original.
+
 Your response MUST be a single valid JSON object with keys:
 - "suspicion_score": integer 1~5
 - "content_typo_report": string (Korean 설명)
@@ -702,6 +707,9 @@ ONLY report a punctuation error if:
 - the sentence has NO ending punctuation at all, OR
 - a closing quotation mark is missing, OR
 - punctuation is clearly malformed (e.g. ",.", ".,", "..", "!!", "??" in a wrong place)
+
+STRICT length rule:
+- If a suggested fix changes the length of the original token by 3 or more characters (after removing spaces), DO NOT report it.
 
 ------------------------------------------------------------
 # 2. OUTPUT FORMAT
