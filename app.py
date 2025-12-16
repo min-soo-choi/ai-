@@ -21,6 +21,7 @@ import google.generativeai as genai
 LOG_SHEET_ID = st.secrets.get("LOG_SHEET_ID")
 LOG_WORKSHEET_NAME = st.secrets.get("LOG_WORKSHEET", "usage_log")
 LOGGING_ENABLED = bool(LOG_SHEET_ID)
+LOGGING_REASON = None if LOGGING_ENABLED else "LOG_SHEET_ID가 설정되어 있지 않아 로깅이 비활성화되었습니다."
 
 from sheet_review import run_sheet_review
 LOG_HEADERS = [
@@ -62,7 +63,7 @@ def log_event(row: dict):
 
     values = [
         now_utc,                              # timestamp_utc
-        st.session_state.get("session_id"),   # session_id
+        _get_session_id(),                    # session_id (없으면 생성)
         row.get("feature", ""),
         row.get("model", ""),
         row.get("status", ""),
@@ -137,7 +138,17 @@ def _get_log_worksheet():
         return None
 
     try:
-        sa_info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])  # ✅ 핵심
+        # 서비스계정은 dict 또는 JSON 문자열 두 형태 모두 지원
+        if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+            raw = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+            sa_info = raw if isinstance(raw, dict) else json.loads(raw)
+        elif "gcp_service_account" in st.secrets:
+            raw = st.secrets["gcp_service_account"]
+            sa_info = raw if isinstance(raw, dict) else json.loads(raw)
+        else:
+            st.warning("LOGGING_ENABLED 이지만 GCP 서비스 계정 정보가 없습니다. 로깅이 비활성화됩니다.")
+            return None
+
         creds = Credentials.from_service_account_info(
             sa_info,
             scopes=[
@@ -164,7 +175,6 @@ def _get_log_worksheet():
     except Exception as e:
         # 최소한 원인 추적 가능하게 로그 남기기
         st.error(f"[LOG] worksheet init failed: {e}")
-        st.code(traceback.format_exc())
         return None
 def _extract_token_usage(response) -> dict:
     """
@@ -187,6 +197,8 @@ def _extract_token_usage(response) -> dict:
 
 def log_gemini_call(feature: str, response=None, latency_ms: int | None = None, ok: bool = True, error_msg: str = ""):
     if not LOGGING_ENABLED:
+        if LOGGING_REASON:
+            st.info(f"[로그 비활성화] {LOGGING_REASON}")
         return
     try:
         ws = _get_log_worksheet()
@@ -351,6 +363,35 @@ PDF_RESTORE_SYSTEM_PROMPT = """
 - [정답 해설] 블록과 그 다음 블록 사이에는 빈 줄을 정확히 1줄만 둔다.
 - [오답 해설] 블록과 원기호(①, ②, ㉠…) 목록 사이에도 빈 줄을 정확히 1줄만 둔다.
 - 블록 내부에서는 불필요한 연속 빈 줄을 제거하고 논리적으로 필요한 경우에만 단일 줄바꿈을 유지한다.
+
+
+※ 정답/오답 분리 규칙 (매우 중요)
+
+- 다음과 같은 패턴이 하나의 문단에 함께 나타나는 경우,
+  반드시 정답과 오답을 분리하여 출력해야 한다.
+
+  예:
+  "정답 ①: ... ②③④⑤는 ..."
+  "정답: ① ... ②, ③, ④, ⑤는 ..."
+  "①은 ..., 나머지는 ..."
+
+- 처리 규칙:
+  1) "정답 ①" 또는 "정답: ①"이 발견되면
+     → "정답 ①"을 단독 한 줄로 분리한다.
+
+  2) 정답 번호 바로 뒤에 오는 설명 문장은
+     반드시 [정답 해설] 아래에 배치한다.
+
+  3) 같은 문단에서 다음 표현이 발견되면:
+     - "②③④⑤는"
+     - "②, ③, ④, ⑤는"
+     - "나머지는"
+     - "기타 보기는"
+     이는 모두 오답 설명으로 간주한다.
+
+  4) 오답 설명은 반드시 [오답 해설] 헤더 아래로 이동시킨다.
+
+  5) 오답 번호는 "②, ③, ④, ⑤"처럼 쉼표로 구분된 형태로 통일한다.
 
 """
 
