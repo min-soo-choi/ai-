@@ -75,7 +75,51 @@ def log_event(row: dict):
         row.get("error", ""),
     ]
 
-    ws.append_row(values, value_input_option="RAW")
+    timestamp_col = _get_header_col_index(ws, "timestamp_utc") or 1
+    target_row = _find_first_empty_row_in_col(ws, col=timestamp_col, start_row=2)
+    start_cell = f"{_col_to_a1(timestamp_col)}{target_row}"
+    end_cell = f"{_col_to_a1(timestamp_col + len(values) - 1)}{target_row}"
+    ws.update(f"{start_cell}:{end_cell}", [values], value_input_option="RAW")
+
+
+def _col_to_a1(col_index: int) -> str:
+    """1-based column index to A1 letter (e.g., 1 -> A)."""
+    result = ""
+    while col_index:
+        col_index, rem = divmod(col_index - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _is_blank_cell(value: str) -> bool:
+    if value is None:
+        return True
+    text = str(value)
+    text = text.replace("\u00a0", " ")
+    return text.strip() == ""
+
+
+def _find_first_empty_row_in_col(ws, col: int = 1, start_row: int = 2) -> int:
+    """Find the first empty row in the given column, starting after headers."""
+    col_letter = _col_to_a1(col)
+    max_rows = ws.row_count
+    values = ws.get(f"{col_letter}{start_row}:{col_letter}{max_rows}")
+
+    for offset, row in enumerate(values):
+        cell_value = row[0] if row else ""
+        if _is_blank_cell(cell_value):
+            return start_row + offset
+
+    return start_row + len(values)
+
+
+def _get_header_col_index(ws, header_name: str) -> int | None:
+    headers = ws.row_values(1)
+    target = header_name.strip().lower()
+    for idx, header in enumerate(headers, start=1):
+        if str(header).strip().lower() == target:
+            return idx
+    return None
     
 def _get_worksheet_by_name(sheet_id: str, worksheet_name: str):
     """로그용 스프레드시트에서 특정 워크시트를 가져오거나 생성"""
