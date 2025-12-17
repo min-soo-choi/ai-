@@ -3184,9 +3184,6 @@ with tab_about:
 
     st.markdown(about_sections.get(selected_section, ""))
 
-
-
-# --- 디버그 탭 ---
 # --- 디버그 탭 ---
 with tab_debug:
     st.subheader("🐞 디버그 / 정산")
@@ -3198,14 +3195,17 @@ with tab_debug:
         st.warning("로그 시트를 불러올 수 없습니다.")
         st.stop()
 
-    rows = ws.get_all_records()
-    if not rows:
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
         st.info("아직 로그 데이터가 없습니다.")
         st.stop()
 
     import pandas as pd
 
-    df = pd.DataFrame(rows)
+    header = values[0]
+    rows = values[1:]
+    normalized = [_normalize_row_to_v2(header, row) for row in rows]
+    df = pd.DataFrame(normalized)
 
     KRW_PER_USD = st.number_input(
         "환율 (KRW/USD)", min_value=500, max_value=3000, value=1450, step=10
