@@ -19,7 +19,7 @@ import google.generativeai as genai
 
 # 로그 설정 (없으면 비활성)
 LOG_SHEET_ID = st.secrets.get("LOG_SHEET_ID")
-LOG_WORKSHEET_NAME = st.secrets.get("LOG_WORKSHEET", "usage_log")
+LOG_WORKSHEET_NAME = st.secrets.get("LOG_WORKSHEET", "usage_log_v2")
 LOGGING_ENABLED = bool(LOG_SHEET_ID)
 LOGGING_REASON = None if LOGGING_ENABLED else "LOG_SHEET_ID가 설정되어 있지 않아 로깅이 비활성화되었습니다."
 
@@ -76,6 +76,206 @@ def log_event(row: dict):
     ]
 
     ws.append_row(values, value_input_option="RAW")
+    
+def _get_worksheet_by_name(sheet_id: str, worksheet_name: str):
+    """로그용 스프레드시트에서 특정 워크시트를 가져오거나 생성"""
+    if not LOGGING_ENABLED:
+        return None
+
+    # 서비스계정은 dict 또는 JSON 문자열 두 형태 모두 지원
+    if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+        raw = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+        sa_info = raw if isinstance(raw, dict) else json.loads(raw)
+    elif "gcp_service_account" in st.secrets:
+        raw = st.secrets["gcp_service_account"]
+        sa_info = raw if isinstance(raw, dict) else json.loads(raw)
+    else:
+        raise RuntimeError("GCP 서비스 계정 정보가 secrets에 없습니다.")
+
+    creds = Credentials.from_service_account_info(
+        sa_info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(sheet_id)
+
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=worksheet_name, rows=5000, cols=30)
+
+    return ws
+
+
+def _normalize_row_to_v2(header: list[str], row: list[str]) -> dict:
+    """
+    v1 시트에서 읽은 row(리스트)를 header에 맞춰 dict로 만든 뒤,
+    v2(LOG_HEADERS) 스키마로 정규화한다.
+    """
+    # 1) v1 dict 만들기 (row 길이가 짧아도 안전하게)
+    d = {h: (row[i] if i < len(row) else "") for i, h in enumerate(header)}
+
+    # 2) v2 스키마로 변환
+    feature = d.get("feature", "") or ""
+    model = d.get("model", "") or d.get("MODEL_NAME", "") or ""
+
+    status = d.get("status", "") or d.get("STATUS", "") or ""
+    # v1에서 "OK"/"ERR" 같은 값이면 v2에 맞춰 소문자로 정규화
+    if str(status).upper() == "OK":
+        status = "ok"
+    elif str(status).upper() in ["ERR", "ERROR", "FAIL"]:
+        status = "error"
+
+    latency_ms = d.get("latency_ms", "") or 0
+
+    prompt_tokens = d.get("prompt_tokens", "") or 0
+    output_tokens = d.get("output_tokens", "") or 0
+    total_tokens = d.get("total_tokens", "") or 0
+
+    # v1의 log_gemini_call 루트는 cost_usd 컬럼이 없고 마지막 칸이 error_msg였을 수 있음
+    cost_usd = d.get("cost_usd", "")
+    error = d.get("error", "")
+
+    # cost_usd가 비어있으면 토큰으로 재계산 시도
+    def to_int(x):
+        try:
+            return int(float(x))
+        except Exception:
+            return 0
+
+    def to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    p = to_int(prompt_tokens)
+    o = to_int(output_tokens)
+
+    if (cost_usd is None) or (str(cost_usd).strip() == ""):
+        # cost_usd가 없으면 재계산
+        cost_usd = calc_gemini_flash_cost_usd(p, o)
+    else:
+        cost_usd = to_float(cost_usd)
+
+    # total_tokens가 비어있으면 p+o
+    t = to_int(total_tokens)
+    if t <= 0:
+        t = p + o
+
+    # timestamp_utc가 없으면 timestamp 같은 이름을 찾아봄
+    ts = d.get("timestamp_utc", "") or d.get("timestamp", "") or ""
+
+    # session_id가 없으면 빈 값
+    session_id = d.get("session_id", "") or d.get("sid", "") or ""
+
+    return {
+        "timestamp_utc": ts,
+        "session_id": session_id,
+        "feature": feature,
+        "model": model,
+        "status": status,
+        "latency_ms": to_int(latency_ms),
+        "prompt_tokens": p,
+        "output_tokens": o,
+        "total_tokens": t,
+        "cost_usd": float(cost_usd),
+        "error": error or "",
+    }
+
+
+def migrate_usage_log_to_v2(
+    source_ws_name: str = "usage_log",
+    target_ws_name: str = "usage_log_v2",
+    batch_size: int = 300,
+):
+    """
+    usage_log(v1) -> usage_log_v2(v2) 마이그레이션
+    - v2 워크시트를 만들고 LOG_HEADERS로 헤더 고정
+    - v1 데이터를 읽어서 v2 스키마로 정규화 후 append
+    """
+    if not LOG_SHEET_ID:
+        raise RuntimeError("LOG_SHEET_ID가 secrets에 없습니다.")
+
+    # source / target ws 열기
+    src = _get_worksheet_by_name(LOG_SHEET_ID, source_ws_name)
+    tgt = _get_worksheet_by_name(LOG_SHEET_ID, target_ws_name)
+
+    # source 전체 값
+    src_values = src.get_all_values()
+    if not src_values or len(src_values) < 2:
+        return {"migrated": 0, "skipped": 0, "reason": "source 시트에 데이터가 없습니다."}
+
+    src_header = src_values[0]
+    src_rows = src_values[1:]
+
+    # target 헤더 세팅(강제)
+    tgt_values = tgt.get_all_values()
+    if not tgt_values:
+        tgt.append_row(LOG_HEADERS, value_input_option="RAW")
+    else:
+        # 헤더가 다르면 1행을 v2 헤더로 덮어쓰기
+        if tgt_values[0] != LOG_HEADERS:
+            tgt.delete_rows(1)
+            tgt.insert_row(LOG_HEADERS, index=1, value_input_option="RAW")
+
+    # 중복 방지: target에 이미 있는 timestamp_utc + feature + latency_ms 조합을 set으로 만듦(간단키)
+    # 데이터가 너무 많으면 비용이 커질 수 있으니, 필요하면 꺼도 됨.
+    existing = set()
+    tgt_all = tgt.get_all_values()
+    if len(tgt_all) > 1:
+        hdr = tgt_all[0]
+        idx_ts = hdr.index("timestamp_utc")
+        idx_ft = hdr.index("feature")
+        idx_lt = hdr.index("latency_ms")
+        for r in tgt_all[1:]:
+            ts = r[idx_ts] if idx_ts < len(r) else ""
+            ft = r[idx_ft] if idx_ft < len(r) else ""
+            lt = r[idx_lt] if idx_lt < len(r) else ""
+            existing.add((ts, ft, lt))
+
+    migrated = 0
+    skipped = 0
+
+    # batch append 준비
+    buffer = []
+
+    for row in src_rows:
+        norm = _normalize_row_to_v2(src_header, row)
+        dedup_key = (norm["timestamp_utc"], norm["feature"], str(norm["latency_ms"]))
+
+        if dedup_key in existing:
+            skipped += 1
+            continue
+
+        buffer.append([
+            norm["timestamp_utc"],
+            norm["session_id"],
+            norm["feature"],
+            norm["model"],
+            norm["status"],
+            norm["latency_ms"],
+            norm["prompt_tokens"],
+            norm["output_tokens"],
+            norm["total_tokens"],
+            norm["cost_usd"],
+            norm["error"],
+        ])
+
+        if len(buffer) >= batch_size:
+            tgt.append_rows(buffer, value_input_option="RAW")
+            migrated += len(buffer)
+            buffer = []
+
+    if buffer:
+        tgt.append_rows(buffer, value_input_option="RAW")
+        migrated += len(buffer)
+
+    return {"migrated": migrated, "skipped": skipped, "target": target_ws_name}
+
 
 def gemini_call(feature: str, prompt: str, generation_config: dict):
     t0 = time.time()
@@ -994,8 +1194,8 @@ def clean_self_equal_corrections(report: str) -> str:
             cleaned_lines.append(line_stripped)
             continue
 
-        orig = m.group(2).strip()
-        fixed = m.group(4).strip()
+        orig = m.group(1).strip()
+        fixed = m.group(2).strip()
 
         if orig == fixed:
             continue
@@ -2987,5 +3187,146 @@ with tab_about:
 
 
 # --- 디버그 탭 ---
+# --- 디버그 탭 ---
 with tab_debug:
-    st.markdown("여기는 추후에 로그, 디버그용 정보를 추가로 표시할 수 있는 영역입니다.")
+    st.subheader("🐞 디버그 / 정산")
+    st.caption("Gemini 호출 로그를 기반으로 기능별 비용 및 토큰 사용량을 집계합니다.")
+    
+
+    ws = _get_log_worksheet()
+    if ws is None:
+        st.warning("로그 시트를 불러올 수 없습니다.")
+        st.stop()
+
+    rows = ws.get_all_records()
+    if not rows:
+        st.info("아직 로그 데이터가 없습니다.")
+        st.stop()
+
+    import pandas as pd
+
+    df = pd.DataFrame(rows)
+
+    KRW_PER_USD = st.number_input(
+        "환율 (KRW/USD)", min_value=500, max_value=3000, value=1450, step=10
+    )
+
+    # -------------------------------
+    # ✅ 안전 처리: 컬럼 없으면 먼저 생성
+    # -------------------------------
+    for col in ["cost_usd", "prompt_tokens", "output_tokens", "total_tokens"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    # 숫자 변환 + 결측 처리
+    df["cost_usd"] = pd.to_numeric(df["cost_usd"], errors="coerce").fillna(0.0)
+    df["prompt_tokens"] = pd.to_numeric(df["prompt_tokens"], errors="coerce").fillna(0).astype(int)
+    df["output_tokens"] = pd.to_numeric(df["output_tokens"], errors="coerce").fillna(0).astype(int)
+    df["total_tokens"] = pd.to_numeric(df["total_tokens"], errors="coerce").fillna(0).astype(int)
+
+    # timestamp → 날짜 (컬럼 없을 수도 있으니 방어)
+    if "timestamp_utc" not in df.columns:
+        df["timestamp_utc"] = None
+    df["date"] = pd.to_datetime(df["timestamp_utc"], errors="coerce").dt.date
+
+    # -------------------------------
+    # 필터 UI
+    # -------------------------------
+    st.markdown("### 🔍 필터")
+
+    col_f1, col_f2, col_f3 = st.columns(3)
+
+    with col_f1:
+        feature_options = sorted(df["feature"].dropna().unique().tolist()) if "feature" in df.columns else []
+        feature_filter = st.multiselect("Feature 선택", options=feature_options, default=None)
+
+    with col_f2:
+        model_options = sorted(df["model"].dropna().unique().tolist()) if "model" in df.columns else []
+        model_filter = st.multiselect("Model 선택", options=model_options, default=None)
+
+    with col_f3:
+        date_options = sorted(df["date"].dropna().unique().tolist())
+        date_filter = st.multiselect("날짜 선택", options=date_options, default=None)
+
+    if feature_filter and "feature" in df.columns:
+        df = df[df["feature"].isin(feature_filter)]
+    if model_filter and "model" in df.columns:
+        df = df[df["model"].isin(model_filter)]
+    if date_filter:
+        df = df[df["date"].isin(date_filter)]
+
+    # -------------------------------
+    # 전체 요약
+    # -------------------------------
+    st.markdown("### 💰 전체 요약")
+
+    total_cost = float(df["cost_usd"].sum())
+    total_cost_krw = total_cost * KRW_PER_USD
+    total_calls = int(len(df))
+    total_tokens = int(df["total_tokens"].sum())
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("총 호출 수", f"{total_calls:,}")
+    col_m2.metric("총 토큰 수", f"{total_tokens:,}")
+    col_m3.metric("총 비용 (USD)", f"${total_cost:.4f}")
+    col_m4.metric("총 비용 (KRW)", f"₩{total_cost_krw:,.0f}")
+
+    # -------------------------------
+    # Feature별 정산
+    # -------------------------------
+    st.markdown("### 🧾 Feature별 정산")
+
+    if "feature" not in df.columns:
+        st.warning("로그에 feature 컬럼이 없어 Feature별 집계를 할 수 없습니다.")
+    else:
+        feature_summary = (
+            df.groupby("feature", dropna=False)
+            .agg(
+                calls=("feature", "count"),
+                total_cost_usd=("cost_usd", "sum"),
+                total_tokens=("total_tokens", "sum"),
+                prompt_tokens=("prompt_tokens", "sum"),
+                output_tokens=("output_tokens", "sum"),
+            )
+            .sort_values("total_cost_usd", ascending=False)
+            .reset_index()
+        )
+
+        # ✅ 원화 컬럼 추가
+        feature_summary["total_cost_krw"] = feature_summary["total_cost_usd"] * KRW_PER_USD
+
+        # 보기 좋게 컬럼 순서 정리 (선택)
+        feature_summary = feature_summary[
+            ["feature", "calls", "total_cost_usd", "total_cost_krw", "total_tokens", "prompt_tokens", "output_tokens"]
+        ]
+
+        st.dataframe(feature_summary, use_container_width=True, hide_index=True)
+
+    # -------------------------------
+    # 날짜별 비용 추이
+    # -------------------------------
+    st.markdown("### 📈 날짜별 비용 추이")
+
+    daily_cost = (
+        df.groupby("date", dropna=False)
+        .agg(total_cost_usd=("cost_usd", "sum"))
+        .reset_index()
+        .sort_values("date")
+    )
+    daily_cost["total_cost_krw"] = daily_cost["total_cost_usd"] * KRW_PER_USD
+
+    # USD 그래프(기존)
+    st.line_chart(daily_cost.set_index("date")["total_cost_usd"])
+
+    # KRW도 같이 보고 싶으면 아래도 추가로 켜면 됨
+    st.line_chart(daily_cost.set_index("date")["total_cost_krw"])
+
+    # -------------------------------
+    # 원본 로그 (확인용)
+    # -------------------------------
+    with st.expander("📄 원본 로그 데이터 보기 (최근 200건)", expanded=False):
+        if "timestamp_utc" in df.columns:
+            view_df = df.sort_values("timestamp_utc", ascending=False).head(200)
+        else:
+            view_df = df.head(200)
+        st.dataframe(view_df, use_container_width=True)
