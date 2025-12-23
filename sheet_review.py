@@ -1016,6 +1016,24 @@ def analyze_row_with_both_langs(row: Dict[str, Any]):
         }
 
     # --- plain / markdown 기준으로 리포트 분리 ---
+    raw_en_report = ""
+    raw_ko_report = ""
+    if isinstance(raw_en, dict):
+        raw_en_report = raw_en.get("content_typo_report", "") or ""
+    if isinstance(raw_ko, dict):
+        raw_ko_report = raw_ko.get("translated_typo_report", "") or ""
+
+    raw_en_plain_report, raw_en_md_report = split_report_by_source(
+        raw_en_report,
+        en_plain,
+        en_md,
+    )
+    raw_ko_plain_report, raw_ko_md_report = split_report_by_source(
+        raw_ko_report,
+        ko_plain,
+        ko_md,
+    )
+
     en_plain_report, en_md_report = split_report_by_source(
         final_en.get("content_typo_report", "") or "",
         en_plain,
@@ -1055,6 +1073,10 @@ def analyze_row_with_both_langs(row: Dict[str, Any]):
             "text_plain": en_plain,
             "text_markdown": en_md,
             "text": en_text,  # 실제로 검수한 통합 텍스트
+            "raw_report_plain": raw_en_plain_report,
+            "raw_report_markdown": raw_en_md_report,
+            "report_plain": en_plain_report,
+            "report_markdown": en_md_report,
             "raw": raw_en,
             "final": final_en,
         },
@@ -1062,6 +1084,10 @@ def analyze_row_with_both_langs(row: Dict[str, Any]):
             "text_plain": ko_plain,
             "text_markdown": ko_md,
             "text": ko_text,
+            "raw_report_plain": raw_ko_plain_report,
+            "raw_report_markdown": raw_ko_md_report,
+            "report_plain": ko_plain_report,
+            "report_markdown": ko_md_report,
             "raw": raw_ko,
             "final": final_ko,
         },

@@ -2351,6 +2351,155 @@ def summarize_json_diff(raw: dict | None, final: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _json_diff_keys(raw: dict | None, final: dict | None) -> list[str]:
+    if not isinstance(raw, dict):
+        raw = {}
+    if not isinstance(final, dict):
+        final = {}
+    keys = []
+    for key in sorted(set(raw.keys()) | set(final.keys())):
+        if raw.get(key, "<없음>") != final.get(key, "<없음>"):
+            keys.append(key)
+    return keys
+
+
+def format_json_diff_html(raw: dict | None, final: dict | None) -> str:
+    if not isinstance(raw, dict):
+        raw = {}
+    if not isinstance(final, dict):
+        final = {}
+
+    rows = []
+    for key in sorted(set(raw.keys()) | set(final.keys())):
+        rv = raw.get(key, "<없음>")
+        fv = final.get(key, "<없음>")
+        if rv == fv:
+            continue
+
+        rv_str = json.dumps(rv, ensure_ascii=False) if isinstance(rv, (dict, list)) else str(rv)
+        fv_str = json.dumps(fv, ensure_ascii=False) if isinstance(fv, (dict, list)) else str(fv)
+
+        rows.append(
+            "<div class='diff-item'>"
+            f"<div class='diff-key'>{html.escape(str(key))}</div>"
+            f"<div class='diff-raw'>raw: {html.escape(rv_str)}</div>"
+            f"<div class='diff-final'>final: {html.escape(fv_str)}</div>"
+            "</div>"
+        )
+
+    if not rows:
+        return "<div class='diff-empty'>차이가 없습니다. (raw와 final이 동일합니다.)</div>"
+
+    return "".join(rows)
+
+
+def _extract_report_targets(report: str) -> list[str]:
+    if not report:
+        return []
+
+    targets = []
+    patterns = [
+        re.compile(r"^- '(.+?)' → '(.+?)':", re.UNICODE),
+        re.compile(r'^- "(.+?)" → "(.+?)":', re.UNICODE),
+    ]
+
+    for line in report.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        for pattern in patterns:
+            m = pattern.match(s)
+            if m:
+                original = m.group(1)
+                if original:
+                    targets.append(original)
+                break
+
+    # 중복 제거 (긴 표현 우선)
+    unique = sorted(set(targets), key=len, reverse=True)
+    return unique
+
+
+def _find_text_spans(text: str, targets: list[str]) -> list[tuple[int, int]]:
+    spans = []
+    for target in targets:
+        start = 0
+        while True:
+            idx = text.find(target, start)
+            if idx == -1:
+                break
+            spans.append((idx, idx + len(target)))
+            start = idx + len(target)
+    return spans
+
+
+def highlight_text_with_reports(text: str, raw_report: str, final_report: str) -> str:
+    if not text:
+        return ""
+
+    raw_targets = _extract_report_targets(raw_report)
+    final_targets = _extract_report_targets(final_report)
+    if not raw_targets and not final_targets:
+        return html.escape(text)
+
+    raw_spans = _find_text_spans(text, raw_targets)
+    final_spans = _find_text_spans(text, final_targets)
+    if not raw_spans and not final_spans:
+        return html.escape(text)
+
+    events = {}
+    for s, e in raw_spans:
+        events.setdefault(s, [0, 0])[0] += 1
+        events.setdefault(e, [0, 0])[0] -= 1
+    for s, e in final_spans:
+        events.setdefault(s, [0, 0])[1] += 1
+        events.setdefault(e, [0, 0])[1] -= 1
+
+    positions = sorted(events.keys())
+    if not positions:
+        return html.escape(text)
+
+    parts = []
+    last = 0
+    raw_active = 0
+    final_active = 0
+
+    for pos in positions:
+        if pos > last:
+            segment = text[last:pos]
+            escaped = html.escape(segment)
+            if raw_active or final_active:
+                if raw_active and final_active:
+                    cls = "text-highlight text-highlight-both"
+                elif raw_active:
+                    cls = "text-highlight text-highlight-raw"
+                else:
+                    cls = "text-highlight text-highlight-final"
+                parts.append(f"<mark class='{cls}'>{escaped}</mark>")
+            else:
+                parts.append(escaped)
+
+        raw_active += events[pos][0]
+        final_active += events[pos][1]
+        last = pos
+
+    if last < len(text):
+        segment = text[last:]
+        escaped = html.escape(segment)
+        if raw_active or final_active:
+            if raw_active and final_active:
+                cls = "text-highlight text-highlight-both"
+            elif raw_active:
+                cls = "text-highlight text-highlight-raw"
+            else:
+                cls = "text-highlight text-highlight-final"
+            parts.append(f"<mark class='{cls}'>{escaped}</mark>")
+        else:
+            parts.append(escaped)
+
+    return "".join(parts)
+
+
 def extract_korean_suggestions_from_raw(raw: dict) -> list[str]:
     if not isinstance(raw, dict):
         return []
@@ -2892,12 +3041,75 @@ with tab_sheet:
         if not raw_results:
             st.info("수집된 Raw 데이터가 없습니다. (검수 대상 행이 없었거나 오류 발생)")
         else:
+            st.markdown(
+                """
+                <style>
+                .diff-item { border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; margin: 10px 0; background: #f8fafc; }
+                .diff-key { font-weight: 700; margin-bottom: 6px; color: #0f172a; }
+                .diff-raw { background: #fff1f2; padding: 6px 8px; border-radius: 6px; margin-bottom: 6px; color: #7f1d1d; }
+                .diff-final { background: #ecfdf3; padding: 6px 8px; border-radius: 6px; color: #14532d; }
+                .diff-empty { color: #475569; }
+                .text-block { background: #f8fafc; color: #0f172a; border-radius: 10px; padding: 12px 14px; overflow-y: auto; white-space: pre-wrap; line-height: 1.6; border: 1px solid #e5e7eb; }
+                .text-block-markdown { background: #ffffff; color: #0f172a; border-radius: 10px; padding: 12px 14px; overflow-y: auto; white-space: pre-wrap; line-height: 1.6; border: 1px solid #e2e8f0; }
+                .text-highlight { padding: 1px 2px; border-radius: 3px; }
+                .text-highlight-raw { background: #fecaca; color: #7f1d1d; }
+                .text-highlight-final { background: #bbf7d0; color: #14532d; }
+                .text-highlight-both { background: #fde68a; color: #92400e; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            diff_meta = {}
+            for item in raw_results:
+                row_index = item.get("sheet_row_index")
+                en = item.get("english", {}) or {}
+                ko = item.get("korean", {}) or {}
+                en_diff = _json_diff_keys(en.get("raw"), en.get("final"))
+                ko_diff = _json_diff_keys(ko.get("raw"), ko.get("final"))
+                diff_meta[row_index] = {
+                    "total": len(en_diff) + len(ko_diff),
+                    "en": len(en_diff),
+                    "ko": len(ko_diff),
+                }
+
+            only_diff_rows = st.checkbox("Raw/Final 차이 있는 행만 보기", value=True)
             row_numbers = [item["sheet_row_index"] for item in raw_results]
+            if only_diff_rows:
+                row_numbers = [r for r in row_numbers if diff_meta.get(r, {}).get("total", 0) > 0]
+            if not row_numbers:
+                st.info("차이가 있는 행이 없습니다. 전체 행으로 표시합니다.")
+                row_numbers = [item["sheet_row_index"] for item in raw_results]
+
+            diff_rows_count = sum(1 for r in diff_meta if diff_meta[r]["total"] > 0)
+            st.caption(f"raw/final 차이 있는 행: {diff_rows_count} / {len(raw_results)}")
+
+            text_block_height = st.slider(
+                "원문 텍스트 영역 높이(px)",
+                min_value=200,
+                max_value=800,
+                value=360,
+                step=20,
+                key="sheet_text_height",
+            )
+            markdown_block_height = st.slider(
+                "마크다운 텍스트 영역 높이(px)",
+                min_value=200,
+                max_value=800,
+                value=300,
+                step=20,
+                key="sheet_markdown_height",
+            )
 
             selected_candidate = st.selectbox(
                 "Raw/Final JSON을 보고 싶은 행 번호를 선택하세요:",
                 options=row_numbers,
-                format_func=lambda x: f"행 {x}번",
+                format_func=lambda x: (
+                    f"행 {x}번"
+                    f" (diff {diff_meta.get(x, {}).get('total', 0)}"
+                    f" | EN {diff_meta.get(x, {}).get('en', 0)}"
+                    f" | KO {diff_meta.get(x, {}).get('ko', 0)})"
+                ),
             )
 
             if st.button("선택한 행 분석 보기"):
@@ -2937,14 +3149,30 @@ with tab_sheet:
                         final_json = bundle.get("final") or {}
 
                         st.markdown("##### 📄 영어 원문 텍스트 (plain)")
-                        st.code(bundle.get("text_plain", "") or "", language="markdown")
+                        highlighted = highlight_text_with_reports(
+                            bundle.get("text_plain", "") or "",
+                            bundle.get("raw_report_plain", "") or "",
+                            bundle.get("report_plain", "") or "",
+                        )
+                        st.markdown(
+                            f"<div class='text-block' style='height: {text_block_height}px'>{highlighted}</div>",
+                            unsafe_allow_html=True,
+                        )
 
                         st.markdown("##### 📝 영어 마크다운 텍스트 (content_markdown)")
-                        st.code(bundle.get("text_markdown", "") or "", language="markdown")
+                        st.markdown(
+                            (
+                                "<div class='text-block-markdown' "
+                                f"style='height: {markdown_block_height}px'>"
+                                f"{highlight_text_with_reports(bundle.get('text_markdown', '') or '', bundle.get('raw_report_markdown', '') or '', bundle.get('report_markdown', '') or '')}"
+                                "</div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
 
                         st.markdown("##### ⚡ Raw vs Final 차이점 (필터링 확인)")
-                        diff_md = summarize_json_diff(raw_json, final_json)
-                        st.markdown(diff_md)
+                        diff_html = format_json_diff_html(raw_json, final_json)
+                        st.markdown(diff_html, unsafe_allow_html=True)
 
                         st.divider()
                         col_final, col_raw = st.columns(2)
@@ -2962,14 +3190,30 @@ with tab_sheet:
                         final_json = bundle.get("final") or {}
 
                         st.markdown("##### 📄 한국어 번역 텍스트 (plain)")
-                        st.code(bundle.get("text_plain", "") or "", language="markdown")
+                        highlighted = highlight_text_with_reports(
+                            bundle.get("text_plain", "") or "",
+                            bundle.get("raw_report_plain", "") or "",
+                            bundle.get("report_plain", "") or "",
+                        )
+                        st.markdown(
+                            f"<div class='text-block' style='height: {text_block_height}px'>{highlighted}</div>",
+                            unsafe_allow_html=True,
+                        )
 
                         st.markdown("##### 📝 한국어 마크다운 텍스트 (content_markdown_translated)")
-                        st.code(bundle.get("text_markdown", "") or "", language="markdown")
+                        st.markdown(
+                            (
+                                "<div class='text-block-markdown' "
+                                f"style='height: {markdown_block_height}px'>"
+                                f"{highlight_text_with_reports(bundle.get('text_markdown', '') or '', bundle.get('raw_report_markdown', '') or '', bundle.get('report_markdown', '') or '')}"
+                                "</div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
 
                         st.markdown("##### ⚡ Raw vs Final 차이점 (필터링 확인)")
-                        diff_md = summarize_json_diff(raw_json, final_json)
-                        st.markdown(diff_md)
+                        diff_html = format_json_diff_html(raw_json, final_json)
+                        st.markdown(diff_html, unsafe_allow_html=True)
 
                         st.divider()
                         col_final, col_raw = st.columns(2)
@@ -2990,13 +3234,29 @@ with tab_sheet:
 
                         st.markdown("##### 📄 영어 마크다운 원문 (content_markdown)")
                         if en_md.strip():
-                            st.code(en_md, language="markdown")
+                            st.markdown(
+                                (
+                                    "<div class='text-block-markdown' "
+                                    f"style='height: {markdown_block_height}px'>"
+                                    f"{html.escape(en_md)}"
+                                    "</div>"
+                                ),
+                                unsafe_allow_html=True,
+                            )
                         else:
                             st.info("영어 마크다운 텍스트가 비어 있습니다.")
 
                         st.markdown("##### 📄 한국어 마크다운 원문 (content_markdown_translated)")
                         if ko_md.strip():
-                            st.code(ko_md, language="markdown")
+                            st.markdown(
+                                (
+                                    "<div class='text-block-markdown' "
+                                    f"style='height: {markdown_block_height}px'>"
+                                    f"{html.escape(ko_md)}"
+                                    "</div>"
+                                ),
+                                unsafe_allow_html=True,
+                            )
                         else:
                             st.info("한국어 마크다운 텍스트가 비어 있습니다.")
 
