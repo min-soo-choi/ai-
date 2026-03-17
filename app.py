@@ -2710,11 +2710,23 @@ MOCK_CSV_COLUMNS = [
 
 TEMP_SAVE_COLUMNS = [
     "slot_label",
+    "null_locked",
     "passage_title",
     *MOCK_CSV_COLUMNS,
 ]
 
 
+def _is_null_locked(row: dict) -> bool:
+    v = row.get("null_locked", "")
+    return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _slot_has_payload(row: dict) -> bool:
+    check_cols = ["content", "passage_id", "source_id", "book_title", "unit_title", "passage_title"]
+    return any(str(row.get(col, "")).strip() for col in check_cols)
+
+
+@st.cache_data(ttl=120)
 def _list_worksheet_titles(spreadsheet_name: str) -> list[str]:
     gc = _get_gspread_client()
     sh = gc.open(spreadsheet_name)
@@ -2746,8 +2758,13 @@ def _save_rows_to_worksheet(spreadsheet_name: str, worksheet_name: str, rows: li
     ws.clear()
     end_cell = f"{_col_to_a1(len(columns))}{len(matrix)}"
     ws.update(f"A1:{end_cell}", matrix, value_input_option="RAW")
+    # 저장 직후 목록/불러오기 캐시가 오래된 값을 보여주지 않도록 무효화
+    _list_worksheet_titles.clear()
+    _load_rows_from_worksheet.clear()
+    _load_worksheet_records_by_name.clear()
 
 
+@st.cache_data(ttl=120)
 def _load_rows_from_worksheet(spreadsheet_name: str, worksheet_name: str) -> list[dict]:
     gc = _get_gspread_client()
     sh = gc.open(spreadsheet_name)
@@ -3507,7 +3524,7 @@ with tab_passage:
         "passage_title",
         "source_id",
         "studio_title",
-        "unit_order_",
+        "unit_order",
         "unit_title",
         "content",
         "content_markdown",
@@ -3549,43 +3566,91 @@ with tab_passage:
             st.error("요청하신 컬럼이 시트에 없습니다. 헤더를 확인해주세요.")
             available_cols = headers
 
-        col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([2, 2, 2, 2, 1])
-        with col_f1:
-            q_content = st.text_input(
-                "content 검색",
-                value="",
-                key="passage_q_content",
-                placeholder="예: climate",
-            ).strip().lower()
-        with col_f2:
-            q_studio = st.text_input(
-                "studio_title 검색",
-                value="",
-                key="passage_q_studio",
-                placeholder="예: ebs",
-            ).strip().lower()
-        with col_f3:
-            q_unit = st.text_input(
-                "unit_title 검색",
-                value="",
-                key="passage_q_unit",
-                placeholder="예: environment",
-            ).strip().lower()
-        with col_f4:
-            q_passage_title = st.text_input(
-                "passage_title 검색",
-                value="",
-                key="passage_q_passage_title",
-                placeholder="예: The Future of AI",
-            ).strip().lower()
-        with col_f5:
-            row_query = st.text_input(
-                "행 번호 조회(쉼표 구분)",
-                value="",
-                key="passage_row_query",
-                placeholder="예: 12, 35, 104",
-            ).strip()
-            only_non_empty = st.checkbox("빈 지문 제외", value=True, key="passage_non_empty")
+        if "passage_search_params" not in st.session_state:
+            st.session_state["passage_search_params"] = {
+                "q_content": "",
+                "q_studio": "",
+                "q_unit": "",
+                "q_passage_title": "",
+                "row_query": "",
+                "only_non_empty": True,
+            }
+        params = st.session_state.get("passage_search_params", {})
+        with st.form("passage_search_form", clear_on_submit=False):
+            col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([2, 2, 2, 2, 1])
+            with col_f1:
+                q_content_input = st.text_input(
+                    "content 검색",
+                    value=params.get("q_content", ""),
+                    key="passage_q_content",
+                    placeholder="예: climate",
+                )
+            with col_f2:
+                q_studio_input = st.text_input(
+                    "studio_title 검색",
+                    value=params.get("q_studio", ""),
+                    key="passage_q_studio",
+                    placeholder="예: ebs",
+                )
+            with col_f3:
+                q_unit_input = st.text_input(
+                    "unit_title 검색",
+                    value=params.get("q_unit", ""),
+                    key="passage_q_unit",
+                    placeholder="예: environment",
+                )
+            with col_f4:
+                q_passage_title_input = st.text_input(
+                    "passage_title 검색",
+                    value=params.get("q_passage_title", ""),
+                    key="passage_q_passage_title",
+                    placeholder="예: The Future of AI",
+                )
+            with col_f5:
+                row_query_input = st.text_input(
+                    "행 번호 조회(쉼표 구분)",
+                    value=params.get("row_query", ""),
+                    key="passage_row_query",
+                    placeholder="예: 12, 35, 104",
+                )
+                only_non_empty_input = st.checkbox(
+                    "빈 지문 제외",
+                    value=bool(params.get("only_non_empty", True)),
+                    key="passage_non_empty",
+                )
+            submitted = st.form_submit_button("검색 실행", type="primary")
+
+        col_reset_l, _ = st.columns([1, 4])
+        with col_reset_l:
+            if st.button("검색 초기화", key="passage_search_reset"):
+                st.session_state["passage_search_params"] = {
+                    "q_content": "",
+                    "q_studio": "",
+                    "q_unit": "",
+                    "q_passage_title": "",
+                    "row_query": "",
+                    "only_non_empty": True,
+                }
+                st.session_state["passage_single_selected_row"] = None
+
+        if submitted:
+            st.session_state["passage_search_params"] = {
+                "q_content": q_content_input.strip().lower(),
+                "q_studio": q_studio_input.strip().lower(),
+                "q_unit": q_unit_input.strip().lower(),
+                "q_passage_title": q_passage_title_input.strip().lower(),
+                "row_query": row_query_input.strip(),
+                "only_non_empty": bool(only_non_empty_input),
+            }
+            st.session_state["passage_single_selected_row"] = None
+
+        params = st.session_state.get("passage_search_params", {})
+        q_content = params.get("q_content", "")
+        q_studio = params.get("q_studio", "")
+        q_unit = params.get("q_unit", "")
+        q_passage_title = params.get("q_passage_title", "")
+        row_query = params.get("row_query", "")
+        only_non_empty = bool(params.get("only_non_empty", True))
 
         row_numbers: set[int] = set()
         if row_query:
@@ -3679,7 +3744,6 @@ with tab_passage:
 
             if (next_selected_row_id != selected_row_id) or (len(checked_ids) > 1):
                 st.session_state["passage_single_selected_row"] = next_selected_row_id
-                st.rerun()
 
             selected_items = []
             if next_selected_row_id is not None:
@@ -3698,7 +3762,7 @@ with tab_passage:
                 selected_row = selected.get("sheet_row_index", "")
                 st.markdown(f"#### 📌 선택 항목 상세 (행 {selected_row})")
 
-                short_cols = [c for c in ["passage_id", "passage_title", "source_id", "studio_title", "unit_order_", "unit_title"] if c in available_cols]
+                short_cols = [c for c in ["passage_id", "passage_title", "source_id", "studio_title", "unit_order", "unit_title"] if c in available_cols]
                 if short_cols:
                     meta = {c: selected.get(c, "") for c in short_cols}
                     st.json(meta, expanded=False)
@@ -3804,15 +3868,16 @@ with tab_mock_csv:
             "과별 문제 수(선택)",
             value="",
             key="mock_tpl_custom_counts",
-            placeholder="예: 1:10,2:8,3:12",
-            help="입력하면 과/과당 값 대신 이 설정으로 템플릿을 생성합니다.",
+            placeholder="예: 1:5,3:8",
+            help="과 번호(1부터) 기준 덮어쓰기입니다. 예: 1:5 -> 1과를 5문항으로 설정",
         ).strip()
         st.write("")
         if st.button("템플릿 생성 (예: 1과 1~10, 2과 1~10)", key="mock_tpl_generate_btn"):
             templated_rows = []
+            lesson_count_map = {lesson: int(template_items) for lesson in range(1, int(template_lessons) + 1)}
+            parse_error = False
+
             if custom_lesson_counts:
-                lesson_specs = []
-                parse_error = False
                 for token in custom_lesson_counts.split(","):
                     token = token.strip()
                     if not token:
@@ -3820,42 +3885,37 @@ with tab_mock_csv:
                     if ":" not in token:
                         parse_error = True
                         break
-                    lesson_str, count_str = token.split(":", 1)
-                    lesson_str = lesson_str.strip()
+                    lesson_no_str, count_str = token.split(":", 1)
+                    lesson_no_str = lesson_no_str.strip()
                     count_str = count_str.strip()
-                    if (not lesson_str.isdigit()) or (not count_str.isdigit()):
+                    if (not lesson_no_str.isdigit()) or (not count_str.isdigit()):
                         parse_error = True
                         break
-                    lesson_no = int(lesson_str)
+                    lesson_no = int(lesson_no_str)
                     item_count = int(count_str)
-                    if lesson_no <= 0 or item_count <= 0:
+                    if lesson_no <= 0 or item_count <= 0 or lesson_no > int(template_lessons):
                         parse_error = True
                         break
-                    lesson_specs.append((lesson_no, item_count))
+                    lesson_count_map[lesson_no] = item_count
 
-                if parse_error or not lesson_specs:
-                    st.warning("과별 문제 수 형식이 올바르지 않습니다. 예: 1:10,2:8,3:12")
-                else:
-                    lesson_specs = sorted(lesson_specs, key=lambda x: x[0])
-                    for lesson, count in lesson_specs:
-                        for item_no in range(1, count + 1):
-                            row = {col: "" for col in MOCK_CSV_COLUMNS}
-                            row["slot_label"] = f"{lesson}과 {item_no}번"
-                            row["passage_title"] = ""
-                            templated_rows.append(row)
+            if parse_error:
+                st.warning(
+                    f"과별 문제 수 형식이 올바르지 않습니다. 예: 1:5,3:8 (범위: 1~{int(template_lessons)})"
+                )
             else:
                 for lesson in range(1, int(template_lessons) + 1):
-                    for item_no in range(1, int(template_items) + 1):
+                    count = int(lesson_count_map.get(lesson, int(template_items)))
+                    for item_no in range(1, count + 1):
                         row = {col: "" for col in MOCK_CSV_COLUMNS}
                         row["slot_label"] = f"{lesson}과 {item_no}번"
+                        row["null_locked"] = ""
                         row["passage_title"] = ""
                         templated_rows.append(row)
 
             if templated_rows:
                 st.session_state["mock_exam_export_rows"] = templated_rows
-                st.session_state["mock_remove_row_idx_next"] = 0
+                st.session_state["mock_action_selected_idx"] = 0
                 st.success(f"템플릿 생성 완료: {len(templated_rows)}칸")
-                st.rerun()
 
     st.markdown("### 💾 임시 저장")
     save_tab_name = st.text_input(
@@ -3912,7 +3972,7 @@ with tab_mock_csv:
                     st.error(f"불러오기 실패: {e}")
                 else:
                     st.session_state["mock_exam_export_rows"] = loaded_rows
-                    st.session_state["mock_remove_row_idx_next"] = 0
+                    st.session_state["mock_action_selected_idx"] = 0 if loaded_rows else None
                     st.success(f"'{selected_temp_tab}' 탭에서 {len(loaded_rows)}개 행을 불러왔습니다.")
                     st.rerun()
 
@@ -3922,7 +3982,7 @@ with tab_mock_csv:
         "passage_title",
         "source_id",
         "studio_title",
-        "unit_order_",
+        "unit_order",
         "unit_title",
         "content",
         "content_markdown",
@@ -3956,6 +4016,17 @@ with tab_mock_csv:
 
     if headers:
         available_cols = [c for c in requested_cols if c in headers]
+        flash = st.session_state.pop("mock_csv_flash", None)
+        if isinstance(flash, dict):
+            level = str(flash.get("level", "")).strip().lower()
+            msg = str(flash.get("msg", "")).strip()
+            if msg:
+                if level == "success":
+                    st.success(msg)
+                elif level == "warning":
+                    st.warning(msg)
+                else:
+                    st.info(msg)
         if "mock_csv_search_params" not in st.session_state:
             st.session_state["mock_csv_search_params"] = {
                 "q_content": "",
@@ -4025,7 +4096,6 @@ with tab_mock_csv:
                     "only_non_empty": True,
                 }
                 st.session_state["mock_csv_selected_row_ids"] = []
-                st.rerun()
 
         if submitted:
             st.session_state["mock_csv_search_params"] = {
@@ -4088,10 +4158,15 @@ with tab_mock_csv:
                 preview_row_ids = [item.get("sheet_row_index") for item in preview_source]
                 selected_row_ids = [rid for rid in selected_row_ids if rid in preview_row_ids]
                 st.session_state["mock_csv_selected_row_ids"] = selected_row_ids
+                prev_selected_row_ids = list(selected_row_ids)
                 preview_rows = []
                 for item in preview_source:
                     rid = item.get("sheet_row_index")
-                    row_view = {"선택": rid in selected_row_ids}
+                    is_selected = rid in selected_row_ids
+                    row_view = {
+                        "선택": is_selected,
+                        "상태": "선택됨" if is_selected else "",
+                    }
                     for col_name in result_columns:
                         value = str(item.get(col_name, ""))
                         limit = 120 if col_name == "content" else 80
@@ -4105,8 +4180,9 @@ with tab_mock_csv:
                     key=f"mock_csv_result_editor_{st.session_state.get('mock_csv_search_version', 0)}",
                     column_config={
                         "선택": st.column_config.CheckboxColumn("선택", help="CSV 목록에 담을 항목 체크"),
+                        "상태": st.column_config.TextColumn("상태"),
                     },
-                    disabled=["studio_title", "unit_title", "passage_title", "content"],
+                    disabled=["상태", "studio_title", "unit_title", "passage_title", "content"],
                 )
 
                 if hasattr(edited_rows, "to_dict"):
@@ -4119,6 +4195,8 @@ with tab_mock_csv:
                     if idx < len(preview_source) and bool(row.get("선택", False)):
                         selected_row_ids.append(preview_source[idx].get("sheet_row_index"))
                 st.session_state["mock_csv_selected_row_ids"] = selected_row_ids
+                if selected_row_ids != prev_selected_row_ids:
+                    st.rerun()
 
                 selected_items = []
                 for item in preview_source:
@@ -4128,32 +4206,14 @@ with tab_mock_csv:
                 st.caption(f"선택된 항목: {len(selected_items)}개")
 
                 current_rows = st.session_state.get("mock_exam_export_rows", [])
-                insert_index = len(current_rows)
-                template_mode = bool(current_rows) and all("slot_label" in r for r in current_rows)
-                add_mode = "맨 아래 추가"
-                if not template_mode:
-                    add_mode = st.radio(
-                        "CSV 목록 추가 방식",
-                        ["맨 아래 추가", "특정 위치에 삽입"],
-                        horizontal=True,
-                        key="mock_csv_add_mode",
-                    )
-                    if add_mode == "특정 위치에 삽입":
-                        position_options = list(range(1, len(current_rows) + 2)) or [1]
-                        insert_position = st.selectbox(
-                            "삽입 위치",
-                            options=position_options,
-                            format_func=lambda x: f"{x}번째 위치",
-                            key="mock_csv_insert_pos",
-                        )
-                        insert_index = max(0, int(insert_position) - 1)
-                else:
-                    filled_count = sum(1 for r in current_rows if str(r.get("content", "")).strip())
-                    st.caption(f"템플릿 채움 상태: {filled_count}/{len(current_rows)}")
+                if current_rows and all("slot_label" in r for r in current_rows):
+                    filled_count = sum(1 for r in current_rows if _slot_has_payload(r))
+                    null_count = sum(1 for r in current_rows if _is_null_locked(r))
+                    st.caption(f"템플릿 채움 상태: {filled_count}/{len(current_rows)} (NULL 고정 {null_count}칸)")
 
                 if st.button("체크한 항목을 CSV 목록에 추가", key="mock_csv_add_row_btn"):
                     if not selected_items:
-                        st.warning("먼저 체크박스로 항목을 선택해주세요.")
+                        st.warning("먼저 항목을 선택해주세요.")
                     else:
                         existing_keys: set[str] = set()
                         for row in current_rows:
@@ -4161,7 +4221,6 @@ with tab_mock_csv:
 
                         added_count = 0
                         skipped_count = 0
-                        write_index = insert_index
 
                         for selected in selected_items:
                             export_row = {"sheet_row_index": selected.get("sheet_row_index", "")}
@@ -4175,9 +4234,12 @@ with tab_mock_csv:
                                 skipped_count += 1
                                 continue
 
-                            if template_mode:
+                            if current_rows and all("slot_label" in r for r in current_rows):
                                 empty_idx = next(
-                                    (i for i, r in enumerate(current_rows) if not str(r.get("content", "")).strip()),
+                                    (
+                                        i for i, r in enumerate(current_rows)
+                                        if (not _is_null_locked(r)) and (not _slot_has_payload(r))
+                                    ),
                                     None,
                                 )
                                 if empty_idx is None:
@@ -4187,20 +4249,33 @@ with tab_mock_csv:
                                 merged = dict(current_rows[empty_idx])
                                 merged.update(export_row)
                                 merged["slot_label"] = slot_label
+                                merged["null_locked"] = ""
                                 current_rows[empty_idx] = merged
-                            elif add_mode == "특정 위치에 삽입":
-                                current_rows.insert(write_index, export_row)
-                                write_index += 1
                             else:
+                                # 템플릿이 아닌 일반 목록은 신규 추가를 맨 아래로만 추가
                                 current_rows.append(export_row)
                             existing_keys.update(new_keys)
                             added_count += 1
 
                         st.session_state["mock_exam_export_rows"] = current_rows
-                        if added_count:
-                            st.success(f"{added_count}개 항목을 CSV 목록에 추가했습니다.")
-                        if skipped_count:
-                            st.info(f"{skipped_count}개 항목은 중복으로 제외했습니다.")
+                        st.session_state["mock_csv_selected_row_ids"] = []
+                        st.session_state["mock_csv_search_version"] = int(st.session_state.get("mock_csv_search_version", 0)) + 1
+                        if added_count and skipped_count:
+                            st.session_state["mock_csv_flash"] = {
+                                "level": "info",
+                                "msg": f"{added_count}개 추가, {skipped_count}개는 중복/빈 슬롯 부족으로 제외되었습니다.",
+                            }
+                        elif added_count:
+                            st.session_state["mock_csv_flash"] = {
+                                "level": "success",
+                                "msg": f"{added_count}개 항목을 CSV 목록에 추가했습니다.",
+                            }
+                        else:
+                            st.session_state["mock_csv_flash"] = {
+                                "level": "warning",
+                                "msg": f"추가된 항목이 없습니다. {skipped_count}개는 중복/빈 슬롯 부족으로 제외되었습니다.",
+                            }
+                        st.rerun()
             else:
                 st.info("조건에 맞는 지문이 없습니다. 검색어/행 번호를 확인해주세요.")
         else:
@@ -4214,76 +4289,195 @@ with tab_mock_csv:
     export_rows = st.session_state.get("mock_exam_export_rows", [])
     st.caption(f"현재 담긴 행 수: {len(export_rows)}")
 
+    def _is_fixed_slot_mode(rows: list[dict]) -> bool:
+        return bool(rows) and all("slot_label" in r for r in rows)
+
+    def _payload_only(row: dict) -> dict:
+        # slot_label은 고정 슬롯 식별자이므로 이동 대상에서 제외하고,
+        # null_locked를 포함한 실제 행 상태는 함께 이동시킨다.
+        return {k: v for k, v in row.items() if k != "slot_label"}
+
+    def _apply_payload_to_slot(slot_row: dict, payload: dict) -> dict:
+        new_row = {"slot_label": slot_row.get("slot_label", "")}
+        for k, v in payload.items():
+            if k != "slot_label":
+                new_row[k] = v
+        if "null_locked" not in new_row:
+            new_row["null_locked"] = slot_row.get("null_locked", "")
+        return new_row
+
     col_e1, col_e2 = st.columns([1, 1])
     with col_e1:
         if st.button("담은 목록 비우기", key="clear_mock_export_rows"):
             st.session_state["mock_exam_export_rows"] = []
+            st.session_state["mock_action_selected_idx"] = None
             st.rerun()
     with col_e2:
-        if export_rows:
-            download_rows = [
-                row for row in export_rows
-                if any(str(row.get(col, "")).strip() for col in ["content", "passage_id", "source_id", "book_title", "unit_title"])
-            ]
-            csv_bytes = _rows_to_csv_bytes(
-                download_rows,
-                MOCK_CSV_COLUMNS,
-            )
-            st.download_button(
-                "CSV 다운로드",
-                data=csv_bytes,
-                file_name="mock_exam_selected_rows.csv",
-                mime="text/csv",
-                key="download_mock_csv",
-            )
+        publish_tab_name = st.text_input(
+            "저장할 시트 탭 이름",
+            value=st.session_state.get("mock_publish_tab_name", "작업결과_01"),
+            key="mock_publish_tab_name",
+            placeholder="예: 작업결과_2026_03_17",
+        ).strip()
+        if st.button("시트 탭으로 저장", key="publish_to_sheet_btn"):
+            if not publish_tab_name:
+                st.warning("저장할 시트 탭 이름을 입력해주세요.")
+            elif not export_rows:
+                st.warning("저장할 누적 목록이 없습니다.")
+            else:
+                if _is_fixed_slot_mode(export_rows):
+                    # 슬롯 모드에서는 빈 슬롯/NULL 고정 슬롯도 행 자체를 유지해서 저장한다.
+                    rows_to_save = []
+                    payload_cols = ["passage_title", *MOCK_CSV_COLUMNS]
+                    for row in export_rows:
+                        out = dict(row)
+                        if _is_null_locked(row):
+                            # NULL 고정 슬롯은 payload를 빈 값으로 고정 저장
+                            for col in payload_cols:
+                                out[col] = ""
+                        rows_to_save.append(out)
+                else:
+                    rows_to_save = [
+                        row for row in export_rows
+                        if any(str(row.get(col, "")).strip() for col in ["content", "passage_id", "source_id", "book_title", "unit_title", "passage_title"])
+                    ]
+                if not rows_to_save:
+                    st.warning("저장할 유효 데이터가 없습니다.")
+                else:
+                    try:
+                        _save_rows_to_worksheet(
+                            passage_sheet_name,
+                            publish_tab_name,
+                            rows_to_save,
+                            TEMP_SAVE_COLUMNS,
+                        )
+                    except Exception as e:
+                        st.error(f"시트 저장 실패: {e}")
+                    else:
+                        st.success(f"'{publish_tab_name}' 탭에 {len(rows_to_save)}개 행을 저장했습니다.")
 
     if export_rows:
-        pending_idx = st.session_state.pop("mock_remove_row_idx_next", None)
-        default_remove_idx = 0
-        if isinstance(pending_idx, int) and 0 <= pending_idx < len(export_rows):
-            default_remove_idx = pending_idx
-        else:
-            current_idx = st.session_state.get("mock_remove_row_idx", 0)
-            if isinstance(current_idx, int) and 0 <= current_idx < len(export_rows):
-                default_remove_idx = current_idx
+        selected_idx = st.session_state.get("mock_action_selected_idx", None)
+        if not isinstance(selected_idx, int) or not (0 <= selected_idx < len(export_rows)):
+            selected_idx = None
+            st.session_state["mock_action_selected_idx"] = None
 
-        remove_options = [
-            (
-                idx,
-                (
-                    (f"{row.get('slot_label', '')} | " if row.get("slot_label") else "")
-                    + 
-                    f"{idx + 1}. "
-                    f"passage_id={row.get('passage_id', '')} | "
-                    f"{str(row.get('passage_title', ''))[:40]}"
-                ),
+        select_preview = []
+        for i, row in enumerate(export_rows[:100]):
+            content_preview = str(row.get("content", ""))
+            if len(content_preview) > 120:
+                content_preview = f"{content_preview[:120]}..."
+            select_preview.append(
+                {
+                    "_idx": i,
+                    "선택": i == selected_idx,
+                    "slot": row.get("slot_label", ""),
+                    "null_state": "NULL" if _is_null_locked(row) else "",
+                    "passage_id": row.get("passage_id", ""),
+                    "passage_title": row.get("passage_title", ""),
+                    "content_preview": content_preview,
+                }
             )
-            for idx, row in enumerate(export_rows)
-        ]
-        remove_idx = st.selectbox(
-            "누적 목록에서 제거할 행 선택",
-            options=[opt[0] for opt in remove_options],
-            format_func=lambda x: next(label for idx, label in remove_options if idx == x),
-            index=default_remove_idx,
-            key="mock_remove_row_idx",
+        edited_select_preview = st.data_editor(
+            select_preview,
+            use_container_width=True,
+            hide_index=True,
+            key="mock_action_select_table_editor",
+            column_config={
+                "선택": st.column_config.CheckboxColumn("선택", help="작업할 행을 하나만 선택하세요."),
+                "null_state": st.column_config.TextColumn("NULL"),
+                "_idx": None,
+            },
+            disabled=["slot", "null_state", "passage_id", "passage_title", "content_preview"],
         )
+        if hasattr(edited_select_preview, "to_dict"):
+            select_records = edited_select_preview.to_dict("records")
+        else:
+            select_records = edited_select_preview
+
+        checked_idxs = []
+        for rec in select_records:
+            idx_raw = rec.get("_idx")
+            try:
+                idx = int(idx_raw)
+            except Exception:
+                continue
+            if idx >= len(export_rows):
+                continue
+            if bool(rec.get("선택", False)):
+                checked_idxs.append(idx)
+
+        next_selected_idx = selected_idx
+        if not checked_idxs:
+            next_selected_idx = None
+        elif len(checked_idxs) == 1:
+            next_selected_idx = checked_idxs[0]
+        else:
+            if selected_idx in checked_idxs:
+                others = [idx for idx in checked_idxs if idx != selected_idx]
+                next_selected_idx = others[-1] if others else selected_idx
+            else:
+                next_selected_idx = checked_idxs[-1]
+
+        if (next_selected_idx != selected_idx) or (len(checked_idxs) > 1):
+            st.session_state["mock_action_selected_idx"] = next_selected_idx
+            st.rerun()
+
+        remove_idx = st.session_state.get("mock_action_selected_idx", None)
+        if remove_idx is None:
+            st.info("누적 목록 표에서 작업할 행을 먼저 선택해주세요.")
+        else:
+            st.caption(f"선택된 행: {remove_idx + 1}번째")
+
+        if _is_fixed_slot_mode(export_rows):
+            null_col1, null_col2 = st.columns([1, 1])
+            with null_col1:
+                if st.button("선택 슬롯 NULL 고정", key="mock_set_null_lock_btn", disabled=(remove_idx is None)):
+                    rows = st.session_state.get("mock_exam_export_rows", [])
+                    if isinstance(remove_idx, int) and 0 <= remove_idx < len(rows):
+                        rows[remove_idx] = _apply_payload_to_slot(rows[remove_idx], {})
+                        rows[remove_idx]["passage_title"] = ""
+                        rows[remove_idx]["null_locked"] = "TRUE"
+                        st.session_state["mock_exam_export_rows"] = rows
+                        st.session_state["mock_action_selected_idx"] = remove_idx
+                        st.rerun()
+            with null_col2:
+                if st.button("선택 슬롯 NULL 해제", key="mock_unset_null_lock_btn", disabled=(remove_idx is None)):
+                    rows = st.session_state.get("mock_exam_export_rows", [])
+                    if isinstance(remove_idx, int) and 0 <= remove_idx < len(rows):
+                        rows[remove_idx]["null_locked"] = ""
+                        st.session_state["mock_exam_export_rows"] = rows
+                        st.session_state["mock_action_selected_idx"] = remove_idx
+                        st.rerun()
 
         move_col1, move_col2, move_col3 = st.columns([1, 1, 2])
         with move_col1:
-            if st.button("선택 항목 위로", key="mock_move_up_btn"):
+            if st.button("선택 항목 위로", key="mock_move_up_btn", disabled=(remove_idx is None)):
                 rows = st.session_state.get("mock_exam_export_rows", [])
-                if 0 < remove_idx < len(rows):
-                    rows[remove_idx - 1], rows[remove_idx] = rows[remove_idx], rows[remove_idx - 1]
+                if isinstance(remove_idx, int) and 0 < remove_idx < len(rows):
+                    if _is_fixed_slot_mode(rows):
+                        p1 = _payload_only(rows[remove_idx - 1])
+                        p2 = _payload_only(rows[remove_idx])
+                        rows[remove_idx - 1] = _apply_payload_to_slot(rows[remove_idx - 1], p2)
+                        rows[remove_idx] = _apply_payload_to_slot(rows[remove_idx], p1)
+                    else:
+                        rows[remove_idx - 1], rows[remove_idx] = rows[remove_idx], rows[remove_idx - 1]
                     st.session_state["mock_exam_export_rows"] = rows
-                    st.session_state["mock_remove_row_idx_next"] = remove_idx - 1
+                    st.session_state["mock_action_selected_idx"] = remove_idx - 1
                     st.rerun()
         with move_col2:
-            if st.button("선택 항목 아래로", key="mock_move_down_btn"):
+            if st.button("선택 항목 아래로", key="mock_move_down_btn", disabled=(remove_idx is None)):
                 rows = st.session_state.get("mock_exam_export_rows", [])
-                if 0 <= remove_idx < len(rows) - 1:
-                    rows[remove_idx], rows[remove_idx + 1] = rows[remove_idx + 1], rows[remove_idx]
+                if isinstance(remove_idx, int) and 0 <= remove_idx < len(rows) - 1:
+                    if _is_fixed_slot_mode(rows):
+                        p1 = _payload_only(rows[remove_idx])
+                        p2 = _payload_only(rows[remove_idx + 1])
+                        rows[remove_idx] = _apply_payload_to_slot(rows[remove_idx], p2)
+                        rows[remove_idx + 1] = _apply_payload_to_slot(rows[remove_idx + 1], p1)
+                    else:
+                        rows[remove_idx], rows[remove_idx + 1] = rows[remove_idx + 1], rows[remove_idx]
                     st.session_state["mock_exam_export_rows"] = rows
-                    st.session_state["mock_remove_row_idx_next"] = remove_idx + 1
+                    st.session_state["mock_action_selected_idx"] = remove_idx + 1
                     st.rerun()
         with move_col3:
             target_position = st.selectbox(
@@ -4292,37 +4486,95 @@ with tab_mock_csv:
                 format_func=lambda x: f"{x}번째",
                 key="mock_move_target_pos",
             )
-            if st.button("위치로 이동", key="mock_move_to_pos_btn"):
+            if st.button("위치로 이동", key="mock_move_to_pos_btn", disabled=(remove_idx is None)):
                 rows = st.session_state.get("mock_exam_export_rows", [])
-                if 0 <= remove_idx < len(rows):
-                    item = rows.pop(remove_idx)
-                    new_idx = max(0, min(len(rows), int(target_position) - 1))
-                    rows.insert(new_idx, item)
+                if isinstance(remove_idx, int) and 0 <= remove_idx < len(rows):
+                    new_idx = max(0, min(len(rows) - 1, int(target_position) - 1))
+                    if _is_fixed_slot_mode(rows):
+                        payloads = [_payload_only(r) for r in rows]
+                        moving = payloads.pop(remove_idx)
+                        payloads.insert(new_idx, moving)
+                        rows = [_apply_payload_to_slot(rows[i], payloads[i]) for i in range(len(rows))]
+                    else:
+                        item = rows.pop(remove_idx)
+                        rows.insert(new_idx, item)
                     st.session_state["mock_exam_export_rows"] = rows
-                    st.session_state["mock_remove_row_idx_next"] = new_idx
+                    st.session_state["mock_action_selected_idx"] = new_idx
                     st.rerun()
 
-        if st.button("선택 행 삭제", key="mock_remove_row_btn"):
+        if st.button("선택 행 삭제", key="mock_remove_row_btn", disabled=(remove_idx is None)):
             rows = st.session_state.get("mock_exam_export_rows", [])
-            if 0 <= remove_idx < len(rows):
-                rows.pop(remove_idx)
+            if isinstance(remove_idx, int) and 0 <= remove_idx < len(rows):
+                if _is_fixed_slot_mode(rows):
+                    rows[remove_idx] = _apply_payload_to_slot(rows[remove_idx], {})
+                    next_idx = remove_idx
+                else:
+                    rows.pop(remove_idx)
+                    next_idx = min(remove_idx, max(len(rows) - 1, 0)) if rows else None
                 st.session_state["mock_exam_export_rows"] = rows
-                next_idx = min(remove_idx, max(len(rows) - 1, 0))
-                st.session_state["mock_remove_row_idx_next"] = next_idx
+                st.session_state["mock_action_selected_idx"] = next_idx
                 st.rerun()
 
         preview = []
-        for row in export_rows[:100]:
+        for i, row in enumerate(export_rows[:100]):
             preview.append(
                 {
+                    "_idx": i,
                     "slot": row.get("slot_label", ""),
+                    "null_locked": _is_null_locked(row),
                     "passage_id": row.get("passage_id", ""),
                     "book_title": row.get("book_title", ""),
                     "unit_title": row.get("unit_title", ""),
                     "passage_title": row.get("passage_title", ""),
                 }
             )
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+        edited_preview = st.data_editor(
+            preview,
+            use_container_width=True,
+            hide_index=True,
+            key="mock_slot_table_editor",
+            column_config={
+                "null_locked": st.column_config.CheckboxColumn("NULL 유지", help="체크하면 해당 슬롯은 자동 채움 대상에서 제외됩니다."),
+                "_idx": None,
+            },
+            disabled=["slot", "passage_id", "book_title", "unit_title", "passage_title"],
+        )
+
+        if hasattr(edited_preview, "to_dict"):
+            edited_records = edited_preview.to_dict("records")
+        else:
+            edited_records = edited_preview
+
+        rows = st.session_state.get("mock_exam_export_rows", [])
+        changed = False
+        blocked_null_lock = 0
+        for rec in edited_records:
+            idx_raw = rec.get("_idx")
+            try:
+                idx = int(idx_raw)
+            except Exception:
+                continue
+            if not (0 <= idx < len(rows)):
+                continue
+            current_locked = _is_null_locked(rows[idx])
+            wanted_locked = bool(rec.get("null_locked", False))
+            # passage_id가 있는 행은 "새로 NULL 고정"만 막고,
+            # 기존 상태를 렌더링 과정에서 자동 해제하지는 않는다.
+            if wanted_locked and (not current_locked) and str(rows[idx].get("passage_id", "")).strip():
+                blocked_null_lock += 1
+                wanted_locked = current_locked
+            if wanted_locked != current_locked:
+                rows[idx]["null_locked"] = "TRUE" if wanted_locked else ""
+                if wanted_locked:
+                    rows[idx] = _apply_payload_to_slot(rows[idx], {})
+                    rows[idx]["passage_title"] = ""
+                    rows[idx]["null_locked"] = "TRUE"
+                changed = True
+        if blocked_null_lock:
+            st.warning(f"passage_id가 있는 {blocked_null_lock}개 행은 NULL 유지로 설정할 수 없습니다.")
+        if changed:
+            st.session_state["mock_exam_export_rows"] = rows
+            st.rerun()
     else:
         st.info("아직 담긴 항목이 없습니다. 영어 지문 조회 탭에서 행을 추가해주세요.")
 
@@ -4556,7 +4808,13 @@ with tab_debug:
         st.warning("로그 시트를 불러올 수 없습니다.")
         st.stop()
 
-    values = ws.get_all_values()
+    try:
+        values = ws.get_all_values()
+    except Exception as e:
+        st.warning(f"로그 시트 조회 중 오류가 발생했습니다: {e}")
+        st.info("권한/시트 존재 여부/Google API 일시 오류를 확인한 뒤 다시 시도해주세요.")
+        st.stop()
+
     if not values or len(values) < 2:
         st.info("아직 로그 데이터가 없습니다.")
         st.stop()
