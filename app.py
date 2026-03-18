@@ -220,6 +220,32 @@ def _load_worksheet_records_by_name(spreadsheet_name: str, worksheet_name: str):
     return headers, records
 
 
+def _normalize_match_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+@st.cache_data(ttl=120)
+def _load_column_records_by_name(
+    spreadsheet_name: str,
+    worksheet_name: str,
+    column_letter: str,
+    start_row: int = 2,
+) -> list[dict]:
+    gc = _get_gspread_client()
+    worksheet = gc.open(spreadsheet_name).worksheet(worksheet_name)
+    col = str(column_letter or "A").strip().upper()
+    values = worksheet.get(f"{col}{int(start_row)}:{col}")
+
+    rows: list[dict] = []
+    for offset, row in enumerate(values):
+        row_idx = int(start_row) + offset
+        cell_value = row[0] if row else ""
+        rows.append({"sheet_row_index": row_idx, "value": str(cell_value or "")})
+    return rows
+
+
 def _normalize_row_to_v2(header: list[str], row: list[str]) -> dict:
     """
     v1 시트에서 읽은 row(리스트)를 header에 맞춰 dict로 만든 뒤,
@@ -2796,8 +2822,8 @@ st.set_page_config(
 st.title("📚 AI 텍스트 검수기 (Gemini 기반)")
 st.caption("한국어/영어 단일 텍스트 + Google Sheets 기반 검수기 (오탈자/형식 위주, 스타일 제안 금지).")
 
-tab_ko, tab_en, tab_pdf, tab_sheet, tab_passage, tab_mock_csv, tab_about, tab_debug = st.tabs(
-    ["✏️ 한국어 검수", "✏️ 영어 검수","📄 PDF 텍스트 정리", "📄 시트 검수", "📚 영어 지문 조회", "📥 모의고사 CSV", "ℹ️ 설명", "🐞 디버그"]
+tab_ko, tab_en, tab_pdf, tab_sheet, tab_passage, tab_mock_csv, tab_batch_match, tab_about, tab_debug = st.tabs(
+    ["✏️ 한국어 검수", "✏️ 영어 검수","📄 PDF 텍스트 정리", "📄 시트 검수", "📚 영어 지문 조회", "📥 모의고사 CSV", "🧩 일괄 지문 매칭", "ℹ️ 설명", "🐞 디버그"]
 )
 
 # --- 한국어 검수 탭 ---
@@ -4577,6 +4603,228 @@ with tab_mock_csv:
             st.rerun()
     else:
         st.info("아직 담긴 항목이 없습니다. 영어 지문 조회 탭에서 행을 추가해주세요.")
+
+
+# --- 일괄 지문 매칭 탭 ---
+with tab_batch_match:
+    st.subheader("🧩 일괄 지문 매칭")
+    st.caption("입력 시트의 한 열 텍스트를 대상 워크시트 content와 비교해 일괄 매칭하고, 결과를 시트 탭으로 저장합니다.")
+
+    passage_sheet_name = st.secrets.get("PASSAGE_SHEET_NAME", "[DATA] Paragraph DB (영어 통합)")
+    target_ws_options = ["교과서", "참고서", "모의고사"]
+
+    col_b1, col_b2 = st.columns([3, 1])
+    with col_b1:
+        st.text_input("스프레드시트 이름", value=passage_sheet_name, key="batch_sheet_name_fixed", disabled=True)
+    with col_b2:
+        if st.button("캐시 새로고침", key="batch_match_reload"):
+            _load_worksheet_records_by_name.clear()
+            _load_column_records_by_name.clear()
+
+    col_c1, col_c2, col_c3 = st.columns([2, 1, 2])
+    with col_c1:
+        input_ws_name = st.text_input(
+            "입력 워크시트 이름",
+            value=st.session_state.get("batch_input_ws_name", "지문 비교"),
+            key="batch_input_ws_name",
+            placeholder="예: 지문 비교",
+        ).strip()
+    with col_c2:
+        input_col_letter = st.text_input(
+            "입력 열",
+            value=st.session_state.get("batch_input_col_letter", "M"),
+            key="batch_input_col_letter",
+            max_chars=4,
+            placeholder="M",
+        ).strip().upper()
+    with col_c3:
+        target_ws_name = st.selectbox(
+            "대상 워크시트",
+            options=target_ws_options,
+            index=target_ws_options.index("모의고사") if "모의고사" in target_ws_options else 0,
+            key="batch_target_ws_name",
+        )
+
+    col_o1, col_o2, col_o3 = st.columns([2, 1, 1])
+    with col_o1:
+        result_ws_name = st.text_input(
+            "결과 저장 탭 이름",
+            value=st.session_state.get("batch_result_ws_name", "일괄매칭_결과"),
+            key="batch_result_ws_name",
+            placeholder="예: 일괄매칭_2026_03_18",
+        ).strip()
+    with col_o2:
+        similarity_threshold = st.slider(
+            "최소 유사도(%)",
+            min_value=50,
+            max_value=100,
+            value=85,
+            step=1,
+            key="batch_similarity_threshold",
+        )
+    with col_o3:
+        top_n = st.number_input(
+            "행당 상위 개수",
+            min_value=1,
+            max_value=5,
+            value=1,
+            step=1,
+            key="batch_top_n",
+        )
+
+    run_batch = st.button("일괄 매칭 실행 + 시트 저장", type="primary", key="batch_run_match_btn")
+    if run_batch:
+        if not input_ws_name:
+            st.warning("입력 워크시트 이름을 입력해주세요.")
+        elif not result_ws_name:
+            st.warning("결과 저장 탭 이름을 입력해주세요.")
+        elif not re.match(r"^[A-Z]+$", input_col_letter):
+            st.warning("입력 열은 A, B, AA 형식으로 입력해주세요.")
+        else:
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+            with st.spinner("일괄 매칭 실행 중입니다. 잠시만 기다려주세요..."):
+                progress_text.info("입력/대상 시트를 불러오는 중...")
+                try:
+                    input_rows = _load_column_records_by_name(
+                        passage_sheet_name,
+                        input_ws_name,
+                        input_col_letter,
+                        2,
+                    )
+                except Exception as e:
+                    st.error(f"입력 시트 로드 실패: {e}")
+                    input_rows = []
+
+                try:
+                    target_headers, target_records = _load_worksheet_records_by_name(
+                        passage_sheet_name,
+                        target_ws_name,
+                    )
+                except Exception as e:
+                    st.error(f"대상 시트 로드 실패: {e}")
+                    target_headers, target_records = [], []
+
+                if not input_rows:
+                    progress_bar.empty()
+                    progress_text.empty()
+                    st.warning("입력 시트에서 읽은 데이터가 없습니다.")
+                elif not target_records or "content" not in target_headers:
+                    progress_bar.empty()
+                    progress_text.empty()
+                    st.warning("대상 워크시트에 데이터가 없거나 content 컬럼이 없습니다.")
+                else:
+                    threshold = float(similarity_threshold) / 100.0
+                    prepared_targets = []
+                    for rec in target_records:
+                        norm_content = _normalize_match_text(rec.get("content", ""))
+                        if norm_content:
+                            prepared_targets.append((rec, norm_content))
+
+                    result_rows: list[dict] = []
+                    total_inputs = len(input_rows)
+                    progress_bar.progress(5)
+                    progress_text.info(f"매칭 처리 중... (0/{total_inputs})")
+
+                    for i, src in enumerate(input_rows, start=1):
+                        src_text = str(src.get("value", "") or "")
+                        src_norm = _normalize_match_text(src_text)
+                        if not src_norm:
+                            continue
+
+                        scored = []
+                        for target, target_norm in prepared_targets:
+                            score = difflib.SequenceMatcher(None, src_norm, target_norm).ratio()
+                            if src_norm in target_norm:
+                                score = min(1.0, score + 0.08)
+                            if score >= threshold:
+                                scored.append((score, target))
+
+                        scored.sort(key=lambda x: x[0], reverse=True)
+                        top_matches = scored[: int(top_n)]
+                        if not top_matches:
+                            result_rows.append(
+                                {
+                                    "input_row_index": src.get("sheet_row_index", ""),
+                                    "input_text": src_text,
+                                    "rank": "",
+                                    "similarity_pct": "",
+                                "target_worksheet": target_ws_name,
+                                "target_row_index": "",
+                                "passage_group_id": "",
+                                "passage_id": "",
+                                    "source_id": "",
+                                    "studio_title": "",
+                                    "book_title": "",
+                                    "unit_title": "",
+                                    "passage_title": "",
+                                    "content": "",
+                                }
+                            )
+                        else:
+                            for rank, (score, target) in enumerate(top_matches, start=1):
+                                result_rows.append(
+                                    {
+                                        "input_row_index": src.get("sheet_row_index", ""),
+                                        "input_text": src_text,
+                                        "rank": rank,
+                                        "similarity_pct": f"{score * 100:.2f}",
+                                        "target_worksheet": target_ws_name,
+                                        "target_row_index": target.get("sheet_row_index", ""),
+                                        "passage_group_id": target.get("passage_group_id", ""),
+                                        "passage_id": target.get("passage_id", ""),
+                                        "source_id": target.get("source_id", ""),
+                                        "studio_title": target.get("studio_title", ""),
+                                        "book_title": target.get("book_title", ""),
+                                        "unit_title": target.get("unit_title", ""),
+                                        "passage_title": target.get("passage_title", ""),
+                                        "content": target.get("content", ""),
+                                    }
+                                )
+
+                        if i == total_inputs or (i % 10 == 0):
+                            pct = max(5, min(95, int(i * 95 / max(total_inputs, 1))))
+                            progress_bar.progress(pct)
+                            progress_text.info(f"매칭 처리 중... ({i}/{total_inputs})")
+
+                    if not result_rows:
+                        progress_bar.empty()
+                        progress_text.empty()
+                        st.info("매칭 결과가 없습니다.")
+                    else:
+                        result_columns = [
+                            "input_row_index",
+                            "input_text",
+                            "rank",
+                            "similarity_pct",
+                            "target_worksheet",
+                            "target_row_index",
+                            "passage_group_id",
+                            "passage_id",
+                            "source_id",
+                            "studio_title",
+                            "book_title",
+                            "unit_title",
+                            "passage_title",
+                            "content",
+                        ]
+                        progress_text.info("결과를 시트에 저장하는 중...")
+                        try:
+                            _save_rows_to_worksheet(
+                                passage_sheet_name,
+                                result_ws_name,
+                                result_rows,
+                                result_columns,
+                            )
+                        except Exception as e:
+                            progress_bar.empty()
+                            progress_text.empty()
+                            st.error(f"결과 저장 실패: {e}")
+                        else:
+                            progress_bar.progress(100)
+                            progress_text.success("실행 완료")
+                            st.success(f"일괄 매칭 완료: {len(result_rows)}개 결과를 '{result_ws_name}' 탭에 저장했습니다.")
+                            st.dataframe(result_rows[:200], use_container_width=True, hide_index=True)
 
 
 # --- 설명 탭 ---
