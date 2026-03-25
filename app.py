@@ -222,6 +222,7 @@ def _load_worksheet_records_by_name(spreadsheet_name: str, worksheet_name: str):
 
 def _normalize_match_text(value: str) -> str:
     text = str(value or "").strip().lower()
+    text = re.sub(r"[^\w\s]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text
 
@@ -4735,9 +4736,12 @@ with tab_batch_match:
                         scored = []
                         for target, target_norm in prepared_targets:
                             score = difflib.SequenceMatcher(None, src_norm, target_norm).ratio()
-                            if src_norm in target_norm:
+                            contains_match = src_norm in target_norm or target_norm in src_norm
+                            if contains_match and len(src_norm) >= 20:
+                                score = max(score, 0.98)
+                            elif src_norm in target_norm:
                                 score = min(1.0, score + 0.08)
-                            if score >= threshold:
+                            if contains_match or score >= threshold:
                                 scored.append((score, target))
 
                         scored.sort(key=lambda x: x[0], reverse=True)
@@ -4749,16 +4753,19 @@ with tab_batch_match:
                                     "input_text": src_text,
                                     "rank": "",
                                     "similarity_pct": "",
-                                "target_worksheet": target_ws_name,
-                                "target_row_index": "",
-                                "passage_group_id": "",
-                                "passage_id": "",
+                                    "target_worksheet": target_ws_name,
+                                    "target_row_index": "",
+                                    "passage_group_id": "",
+                                    "passage_id": "",
                                     "source_id": "",
                                     "studio_title": "",
                                     "book_title": "",
                                     "unit_title": "",
                                     "passage_title": "",
                                     "content": "",
+                                    "content_markdown": "",
+                                    "content_translated": "",
+                                    "content_markdown_translated": "",
                                 }
                             )
                         else:
@@ -4779,6 +4786,9 @@ with tab_batch_match:
                                         "unit_title": target.get("unit_title", ""),
                                         "passage_title": target.get("passage_title", ""),
                                         "content": target.get("content", ""),
+                                        "content_markdown": target.get("content_markdown", ""),
+                                        "content_translated": target.get("content_translated", ""),
+                                        "content_markdown_translated": target.get("content_markdown_translated", ""),
                                     }
                                 )
 
@@ -4807,6 +4817,9 @@ with tab_batch_match:
                             "unit_title",
                             "passage_title",
                             "content",
+                            "content_markdown",
+                            "content_translated",
+                            "content_markdown_translated",
                         ]
                         progress_text.info("결과를 시트에 저장하는 중...")
                         try:
